@@ -9,6 +9,7 @@ use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::fs::File;
+use std::sync::mpsc;
 
 
 use super::DisplayInfo;
@@ -28,18 +29,21 @@ fn handle_key_event(
     timestamp: u128,
     key_log: &Mutex<BufWriter<File>>,
     pressed_keys: &Mutex<Vec<String>>,
-) {
+) -> bool {
     let key_str = format!("{:?}", key);
     let mut keys = pressed_keys.lock().unwrap();
+    let mut should_restart = false;
 
     if is_press {
         if !keys.contains(&key_str) {
+            let had_meta = keys.contains(&"MetaLeft".to_string());
+            let had_shift = keys.contains(&"ShiftLeft".to_string());
+            
             keys.push(key_str.clone());
             
-            if keys.contains(&"MetaLeft".to_string()) && 
-               keys.contains(&"ShiftLeft".to_string()) && 
-               key_str == "KeyW" {
-                println!("Command + Shift + L detected!");
+            if had_meta && had_shift && key_str == "KeyL" {
+                should_restart = true;
+                keys.clear();
             }
         }
     } else {
@@ -57,6 +61,8 @@ fn handle_key_event(
         let _ = writer.write_all(line.as_bytes());
         let _ = writer.flush();
     }
+
+    should_restart
 }
 
 pub fn unified_event_listener_thread(
@@ -64,6 +70,7 @@ pub fn unified_event_listener_thread(
     keypress_log: Arc<Mutex<BufWriter<File>>>,
     mouse_log: Arc<Mutex<BufWriter<File>>>,
     pressed_keys: Arc<Mutex<Vec<String>>>,
+    restart_tx: mpsc::Sender<()>,
 ) {
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -110,6 +117,7 @@ pub fn unified_event_listener_thread(
         let keypress_log = keypress_log.clone();
         let mouse_log = mouse_log.clone();
         let pressed_keys = pressed_keys.clone();
+        let restart_tx = restart_tx.clone();
         move || {
             let _ = listen(move |event: Event| {
                 if !should_run.load(Ordering::SeqCst) {
@@ -123,7 +131,9 @@ pub fn unified_event_listener_thread(
 
                 match event.event_type {
                     EventType::KeyPress(k) => {
-                        handle_key_event(true, k, timestamp, &keypress_log, &pressed_keys);
+                        if handle_key_event(true, k, timestamp, &keypress_log, &pressed_keys) {
+                            let _ = restart_tx.send(());
+                        }
                     }
                     EventType::KeyRelease(k) => {
                         handle_key_event(false, k, timestamp, &keypress_log, &pressed_keys);

@@ -25,7 +25,6 @@ ctrlc = { version = "3.4.5", features = ["termination"] }
 lazy_static = "1.5.0"
 termion = "2.0.1"
 
-
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24.0"
 core-foundation = "0.10.0"

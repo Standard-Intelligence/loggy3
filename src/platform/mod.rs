@@ -20,7 +20,7 @@ pub static FFMPEG_ENCODER: &str = "h264_videotoolbox";
 pub static FFMPEG_ENCODER: &str = "libx264";
 
 
-use std::{fs::File, io::BufWriter, sync::{atomic::AtomicBool, Arc, Mutex}};
+use std::{fs::File, io::BufWriter, sync::{atomic::AtomicBool, Arc, Mutex, mpsc}};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -43,8 +43,9 @@ pub fn unified_event_listener_thread(
     keypress_log: Arc<Mutex<BufWriter<File>>>,
     mouse_log: Arc<Mutex<BufWriter<File>>>,
     pressed_keys: Arc<Mutex<Vec<String>>>,
+    restart_tx: mpsc::Sender<()>,
 ) {
-    current::unified_event_listener_thread(should_run, keypress_log, mouse_log, pressed_keys);
+    current::unified_event_listener_thread(should_run, keypress_log, mouse_log, pressed_keys, restart_tx);
 }
 
 pub fn get_display_info() -> Vec<DisplayInfo> {
