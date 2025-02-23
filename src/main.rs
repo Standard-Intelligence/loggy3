@@ -373,7 +373,7 @@ fn initialize_capturer(target: &Target) -> Option<Arc<Mutex<Capturer>>> {
 fn get_ffmpeg_path() -> PathBuf {
     let ffmpeg_paths = vec![
         "/opt/homebrew/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg", 
+        "/usr/local/bin/ffmpeg",
         "/usr/bin/ffmpeg",
     ];
 
