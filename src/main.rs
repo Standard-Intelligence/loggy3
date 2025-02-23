@@ -5,7 +5,7 @@ use platform::{DisplayInfo, FFMPEG_ENCODER};
 use ctrlc::set_handler;
 use std::{
     fs::{create_dir_all, File},
-    io::{BufWriter, Write},
+    io::{BufWriter, Write, BufReader},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -16,7 +16,6 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
-use stdio_override::{StdoutOverride, StderrOverride};
 use scap::{
     capturer::{Capturer, Options, Resolution},
     frame::{Frame, FrameType, YUVFrame},
@@ -25,23 +24,6 @@ use scap::{
 
 mod platform;
 
-fn setup_logging() -> Result<(StdoutOverride, StderrOverride)> {
-    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
-    let log_path = home_dir.join("loggy3/loggy3.log");
-    
-    if let Some(parent) = log_path.parent() {
-        create_dir_all(parent)?;
-    }
-    
-    let _log_file = File::create(&log_path)?;
-    
-    let stdout_guard = StdoutOverride::from_file(&log_path)?;
-    let stderr_guard = StderrOverride::from_file(&log_path)?;
-    
-    println!("Logging initialized at {}", Local::now());
-    
-    Ok((stdout_guard, stderr_guard))
-}
 
 struct Session {
     should_run: Arc<AtomicBool>,
@@ -59,17 +41,11 @@ struct Session {
     error_tx: Sender<()>,
     
     displays: Vec<DisplayInfo>,
-    
-    // Keep the guards alive for the program duration
-    _stdout_guard: StdoutOverride,
-    _stderr_guard: StderrOverride,
+    progress_threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl Session {
     fn new(should_run: Arc<AtomicBool>) -> Result<Option<Self>> {
-        // Set up logging first
-        let (stdout_guard, stderr_guard) = setup_logging()?;
-        
         let displays = platform::get_display_info();
         if displays.is_empty() {
             return Ok(None);
@@ -105,8 +81,7 @@ impl Session {
             error_rx,
             error_tx,
             displays,
-            _stdout_guard: stdout_guard,
-            _stderr_guard: stderr_guard,
+            progress_threads: Vec::new(),
         }))
     }
 
@@ -142,6 +117,12 @@ impl Session {
                 thread::sleep(Duration::from_millis(100));
             }
         }
+
+        // Stop progress indicator threads
+        for handle in self.progress_threads {
+            let _ = handle.join();
+        }
+
         println!("Session stopped: {}", self.session_dir.display());
     }
 
@@ -166,11 +147,23 @@ impl Session {
     }
 }
 
-
+fn progress_indicator_thread(display_id: String, stdout: impl std::io::Read + Send + 'static) {
+    let _reader = BufReader::new(stdout);
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let display_num = display_id.parse::<i32>().unwrap_or(0);
+    
+    // Move cursor to line based on display ID
+    print!("\x1B[{};0H", display_num + 1);
+    print!("\x1B[K"); // Clear line
+    
+    for s in spinner.iter().cycle() {
+        print!("\x1B[{};0H\x1B[K\x1B[1;32mRecording display {} {}\x1B[0m", display_num + 1, display_id, s);
+        std::io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_millis(100));
+    }
+}
 
 fn main() -> Result<()> {
-    setup_logging()?;
-
     let should_run = Arc::new(AtomicBool::new(true));
 
     let sr_for_signals = should_run.clone();
@@ -245,8 +238,6 @@ fn capture_display_thread(
 ) {
     
     let targets = scap::get_all_targets().into_iter().filter(|t| matches!(t, Target::Display(_))).collect::<Vec<_>>();
-    println!("targets: {:?}", targets);
-    println!("display_info: {:?}", display_info);
     
     let target = match targets.iter()
         .find(|t| match t {
@@ -292,6 +283,20 @@ fn capture_display_thread(
             return;
         }
     };
+
+    // Start progress indicator thread
+    let stdout = ffmpeg_child.stdout.take().unwrap();
+    let display_id = display_info.id.to_string();
+    thread::spawn(move || {
+        progress_indicator_thread(display_id, stdout);
+    });
+
+    // Redirect stderr to /dev/null
+    if let Some(stderr) = ffmpeg_child.stderr.take() {
+        thread::spawn(move || {
+            let _ = std::io::copy(&mut BufReader::new(stderr), &mut std::io::sink());
+        });
+    }
     
     let frames_log_path = display_dir.join("frames.log");
     let frames_log_file = match File::create(&frames_log_path) {
@@ -303,21 +308,19 @@ fn capture_display_thread(
     };
     let mut frames_log = BufWriter::new(frames_log_file);
     
-    let mut consecutive_failures = 0;
     while should_run.load(Ordering::SeqCst) {
         let (tx, rx) = mpsc::channel();
         let capturer_clone = capturer.clone();
 
-        //thread::spawn(move || {
+        thread::spawn(move || {
             if let Ok(c) = capturer_clone.lock() {
                 let frame = c.get_next_frame();
                 let _ = tx.send(frame);
             }
-        //});
+        });
 
-        match rx.recv_timeout(Duration::from_secs(60)) {
+        match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(Frame::YUVFrame(frame))) => {
-                consecutive_failures = 0;
                 if let Err(e) = write_frame(&mut ffmpeg_stdin, &frame, &mut frames_log) {
                     eprintln!("Write error for display {}: {}", display_info.id, e);
                     break;
@@ -327,17 +330,13 @@ fn capture_display_thread(
 
             Ok(Err(e)) => {
                 eprintln!("Frame error on display {}: {}", display_info.id, e);
-                handle_capture_error(&mut consecutive_failures, &error_tx);
-                if consecutive_failures >= 3 {
-                    break;
-                }
+                handle_capture_error(&error_tx);
+                break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 eprintln!("Frame timeout on display {}", display_info.id);
-                handle_capture_error(&mut consecutive_failures, &error_tx);
-                if consecutive_failures >= 3 {
-                    break;
-                }
+                handle_capture_error(&error_tx);
+                break;
             }
             Err(e) => {
                 eprintln!("Channel error on display {}: {}", display_info.id, e);
@@ -351,11 +350,8 @@ fn capture_display_thread(
     println!("Stopped capture for display {}", display_info.id);
 }
 
-fn handle_capture_error(fails: &mut i32, error_tx: &Sender<()>) {
-    *fails += 1;
-    if *fails >= 3 {
-        let _ = error_tx.send(());
-    }
+fn handle_capture_error(error_tx: &Sender<()>) {
+    let _ = error_tx.send(());
 }
 
 fn initialize_capturer(target: &Target) -> Option<Arc<Mutex<Capturer>>> {
@@ -434,6 +430,8 @@ fn initialize_ffmpeg(
             &output_str,
         ])
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
 
     let stdin = child.stdin.take().unwrap();

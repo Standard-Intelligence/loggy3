@@ -37,6 +37,39 @@ fi
 
 chmod +x "$FRAMEWORKS_DIR/ffmpeg"
 
+cp "${CARGO_TARGET_DIR}/release/${APP_NAME}" "${APP_BUNDLE}/Contents/MacOS/"
+
+cp "${PROJECT_DIR}/assets/icon.icns" "${APP_BUNDLE}/Contents/Resources/"
+
+# Make the binary executable
+chmod +x "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
+
+# Create a wrapper script to launch in Terminal
+cat > "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}_wrapper.sh" << EOF
+#!/bin/bash
+DIR="\$( cd "\$( dirname "\${BASH_SOURCE[0]}" )" && pwd )"
+BINARY="\${DIR}/${APP_NAME}_binary"
+
+osascript <<END
+tell application "Terminal"
+    if not (exists window 1) then
+        do script ""
+    end if
+    do script "\"\${BINARY}\"" in window 1
+    activate
+end tell
+END
+EOF
+
+chmod +x "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}_wrapper.sh"
+
+# Move the original binary and update the wrapper to be the main executable
+mv "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}_binary"
+mv "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}_wrapper.sh" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
+
+# Update Info.plist to not be an LSUIElement (background) app
+sed -i '' 's/<key>LSUIElement<\/key>\n    <true\/>//' "${APP_BUNDLE}/Contents/Info.plist"
+
 cat > "${APP_BUNDLE}/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -91,32 +124,5 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" << EOF
 </dict>
 </plist>
 EOF
-
-cp "${CARGO_TARGET_DIR}/release/${APP_NAME}" "${APP_BUNDLE}/Contents/MacOS/"
-
-cp "${PROJECT_DIR}/assets/icon.icns" "${APP_BUNDLE}/Contents/Resources/"
-
-# Create a wrapper script to launch in Terminal
-cat > "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}_wrapper.sh" << 'EOF'
-#!/bin/bash
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-BINARY="${DIR}/${APP_NAME}"
-
-osascript <<END
-tell application "Terminal"
-    activate
-    do script "\"${BINARY}\""
-end tell
-END
-EOF
-
-chmod +x "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}_wrapper.sh"
-
-# Move the original binary and update the wrapper to be the main executable
-mv "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}_binary"
-mv "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}_wrapper.sh" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
-
-# Update Info.plist to not be an LSUIElement (background) app
-sed -i '' 's/<key>LSUIElement<\/key>\n    <true\/>//' "${APP_BUNDLE}/Contents/Info.plist"
 
 echo "App bundle created at: ${APP_BUNDLE}"
