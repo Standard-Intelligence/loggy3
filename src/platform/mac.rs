@@ -35,6 +35,12 @@ fn handle_key_event(
     if is_press {
         if !keys.contains(&key_str) {
             keys.push(key_str.clone());
+            
+            if keys.contains(&"MetaLeft".to_string()) && 
+               keys.contains(&"ShiftLeft".to_string()) && 
+               key_str == "KeyW" {
+                println!("Command + Shift + L detected!");
+            }
         }
     } else {
         keys.retain(|k| k != &key_str);

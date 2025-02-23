@@ -5,7 +5,7 @@ use platform::{DisplayInfo, FFMPEG_ENCODER};
 use ctrlc::set_handler;
 use std::{
     fs::{create_dir_all, File},
-    io::{BufWriter, Write, BufReader},
+    io::{BufWriter, Write, BufReader, BufRead},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -147,23 +147,11 @@ impl Session {
     }
 }
 
-fn progress_indicator_thread(display_id: String, stdout: impl std::io::Read + Send + 'static) {
-    let _reader = BufReader::new(stdout);
-    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let display_num = display_id.parse::<i32>().unwrap_or(0);
-    
-    // Move cursor to line based on display ID
-    print!("\x1B[{};0H", display_num + 1);
-    print!("\x1B[K"); // Clear line
-    
-    for s in spinner.iter().cycle() {
-        print!("\x1B[{};0H\x1B[K\x1B[1;32mRecording display {} {}\x1B[0m", display_num + 1, display_id, s);
-        std::io::stdout().flush().unwrap();
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
 fn main() -> Result<()> {
+    // Clear terminal window
+    print!("\x1B[2J\x1B[1;1H");
+    std::io::stdout().flush().unwrap();
+
     let should_run = Arc::new(AtomicBool::new(true));
 
     let sr_for_signals = should_run.clone();
@@ -284,17 +272,23 @@ fn capture_display_thread(
         }
     };
 
-    // Start progress indicator thread
-    let stdout = ffmpeg_child.stdout.take().unwrap();
-    let display_id = display_info.id.to_string();
-    thread::spawn(move || {
-        progress_indicator_thread(display_id, stdout);
-    });
-
-    // Redirect stderr to /dev/null
-    if let Some(stderr) = ffmpeg_child.stderr.take() {
+    // Just redirect stdout to /dev/null since we don't need it
+    if let Some(stdout) = ffmpeg_child.stdout.take() {
         thread::spawn(move || {
-            let _ = std::io::copy(&mut BufReader::new(stderr), &mut std::io::sink());
+            let _ = std::io::copy(&mut BufReader::new(stdout), &mut std::io::sink());
+        });
+    }
+
+    // Print any error messages from ffmpeg
+    if let Some(stderr) = ffmpeg_child.stderr.take() {
+        let display_id = display_info.id;
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    eprintln!("FFmpeg (display {}): {}", display_id, line);
+                }
+            }
         });
     }
     
@@ -376,17 +370,9 @@ fn initialize_capturer(target: &Target) -> Option<Arc<Mutex<Capturer>>> {
 }
 
 fn get_ffmpeg_path() -> PathBuf {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(app_bundle) = exe_path.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
-            let bundled_ffmpeg = app_bundle.join("Contents/Frameworks/ffmpeg");
-            if bundled_ffmpeg.exists() {
-                return bundled_ffmpeg;
-            }
-        }
-    }
     let ffmpeg_paths = vec![
         "/opt/homebrew/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg", 
         "/usr/bin/ffmpeg",
     ];
 
@@ -397,6 +383,15 @@ fn get_ffmpeg_path() -> PathBuf {
         }
     }
     
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(app_bundle) = exe_path.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+            let bundled_ffmpeg = app_bundle.join("Contents/Frameworks/ffmpeg");
+            if bundled_ffmpeg.exists() {
+                return bundled_ffmpeg;
+            }
+        }
+    }
+
     PathBuf::from("ffmpeg")
 }
 
@@ -427,6 +422,7 @@ fn initialize_ffmpeg(
             "-segment_time", "60",
             "-reset_timestamps", "1",
             "-strftime", "1",
+            "-loglevel", "error",
             &output_str,
         ])
         .stdin(Stdio::piped())
