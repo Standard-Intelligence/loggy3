@@ -21,7 +21,6 @@ use scap::{
     frame::{Frame, FrameType, YUVFrame},
     Target,
 };
-use std::fs;
 
 mod platform;
 
@@ -43,9 +42,6 @@ struct Session {
     
     displays: Vec<DisplayInfo>,
     progress_threads: Vec<thread::JoinHandle<()>>,
-
-    restart_rx: Receiver<()>,
-    restart_tx: Sender<()>,
 }
 
 impl Session {
@@ -74,8 +70,6 @@ impl Session {
 
         let (error_tx, error_rx) = mpsc::channel();
 
-        let (restart_tx, restart_rx) = mpsc::channel();
-
         Ok(Some(Self {
             should_run,
             session_dir,
@@ -88,8 +82,6 @@ impl Session {
             error_tx,
             displays,
             progress_threads: Vec::new(),
-            restart_rx,
-            restart_tx,
         }))
     }
 
@@ -98,9 +90,13 @@ impl Session {
         let kp_log = self.keypress_log.clone();
         let m_log = self.mouse_log.clone();
         let keys = self.pressed_keys.clone();
-        let restart_tx = self.restart_tx.clone();
         self.event_thread = Some(thread::spawn(move || {
-            platform::unified_event_listener_thread(sr_clone_el, kp_log, m_log, keys, restart_tx)
+            platform::unified_event_listener_thread(
+                sr_clone_el,
+                kp_log,
+                m_log,
+                keys,
+            )
         }));
 
         for display in self.displays.clone() {
@@ -143,266 +139,6 @@ impl Session {
         full_restart
     }
 
-    fn check_for_restart(&mut self) -> bool {
-        self.restart_rx.try_recv().is_ok()
-    }
-
-    fn get_frame_count(&self, mp4_path: &PathBuf) -> Option<usize> {
-        let ffprobe_path = get_ffmpeg_path().parent().unwrap().join("ffprobe");
-        
-        let output = Command::new(ffprobe_path)
-            .args(&[
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-count_packets",
-                "-show_entries", "stream=nb_read_packets",
-                "-of", "csv=p=0",
-                mp4_path.to_str().unwrap()
-            ])
-            .output()
-            .ok()?;
-
-        String::from_utf8(output.stdout)
-            .ok()?
-            .trim()
-            .parse::<usize>()
-            .ok()
-    }
-
-    fn get_timestamp_range(&self, path: &PathBuf, lines_to_remove: usize) -> Option<(u128, u128)> {
-        if let Ok(file) = File::open(path) {
-            let reader = BufReader::new(file);
-            let mut first_timestamp = None;
-            let mut last_timestamp = None;
-            
-            // Read only the lines we're going to remove
-            for (i, line) in reader.lines().take(lines_to_remove).enumerate() {
-                if let Ok(line) = line {
-                    if let Ok(timestamp) = line.trim().parse::<u128>() {
-                        if i == 0 {
-                            first_timestamp = Some(timestamp);
-                        }
-                        last_timestamp = Some(timestamp);
-                    }
-                }
-            }
-            
-            if let (Some(first), Some(last)) = (first_timestamp, last_timestamp) {
-                return Some((first, last));
-            }
-        }
-        None
-    }
-
-    fn clean_log_file_by_timestamp_range(&self, path: &PathBuf, start_time: u128, end_time: u128) {
-        if !path.exists() {
-            println!("    {} doesn't exist, skipping", path.file_name().unwrap().to_string_lossy());
-            return;
-        }
-
-        let temp_path = path.with_extension("tmp");
-        if let Ok(file) = File::open(path) {
-            if let Ok(temp_file) = File::create(&temp_path) {
-                let reader = BufReader::new(file);
-                let mut writer = BufWriter::new(temp_file);
-                let mut total_lines = 0;
-                let mut kept_lines = 0;
-
-                for line in reader.lines().filter_map(|l| l.ok()) {
-                    total_lines += 1;
-                    if let Some(timestamp_str) = line.split(',').next() {
-                        if let Ok(timestamp) = timestamp_str.trim_matches(|c| c == '(' || c == ')')
-                            .parse::<u128>() 
-                        {
-                            if timestamp < start_time || timestamp > end_time {
-                                writeln!(writer, "{}", line).ok();
-                                kept_lines += 1;
-                            }
-                        }
-                    }
-                }
-                
-                writer.flush().ok();
-                println!("    Processed {} lines, kept {} lines", total_lines, kept_lines);
-            }
-        }
-        
-        fs::rename(&temp_path, path).ok();
-    }
-
-    fn clean_log_file_by_lines(&self, path: &PathBuf, lines_to_remove: usize) {
-        if !path.exists() {
-            println!("    {} doesn't exist, skipping", path.file_name().unwrap().to_string_lossy());
-            return;
-        }
-
-        let temp_path = path.with_extension("tmp");
-        if let Ok(file) = File::open(path) {
-            if let Ok(temp_file) = File::create(&temp_path) {
-                let reader = BufReader::new(file);
-                let mut writer = BufWriter::new(temp_file);
-                let mut total_lines = 0;
-                let mut kept_lines = 0;
-
-                // Skip the lines we want to remove
-                for line in reader.lines().skip(lines_to_remove).filter_map(|l| l.ok()) {
-                    total_lines += 1;
-                    writeln!(writer, "{}", line).ok();
-                    kept_lines += 1;
-                }
-                
-                writer.flush().ok();
-                println!("    Processed {} lines, kept {} lines", total_lines + lines_to_remove, kept_lines);
-            }
-        }
-        
-        fs::rename(&temp_path, path).ok();
-    }
-
-    fn handle_restart(&mut self) {
-        println!("\nHandling Command+Shift+L restart...");
-        
-        let mut latest_timestamp_range = None;
-        
-        // Process each display
-        for display in &self.displays {
-            let display_dir = self.session_dir.join(format!("display_{}_{}", display.id, display.title));
-            if !display_dir.exists() {
-                println!("Skipping display {} - directory doesn't exist", display.id);
-                continue;
-            }
-
-            println!("\nProcessing display {} ({}):", display.id, display.title);
-
-            // Find and delete the two most recent MP4 files
-            let mut mp4_files: Vec<_> = fs::read_dir(&display_dir)
-                .unwrap()
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| {
-                    entry.path()
-                        .extension()
-                        .map_or(false, |ext| ext == "mp4")
-                })
-                .collect();
-
-            if mp4_files.is_empty() {
-                println!("  No MP4 files found");
-                continue;
-            }
-
-            mp4_files.sort_by_key(|entry| entry.metadata().unwrap().modified().unwrap());
-            
-            let files_to_remove: Vec<_> = mp4_files.iter().rev().take(2).collect();
-            
-            println!("  Found {} MP4 files, removing {} most recent:", 
-                mp4_files.len(), files_to_remove.len());
-
-            let mut frames_in_files = 0;
-            for file in &files_to_remove {
-                let path = file.path();
-                if let Some(frame_count) = self.get_frame_count(&path) {
-                    println!("    Removing: {} ({} frames)", 
-                        path.file_name().unwrap().to_string_lossy(),
-                        frame_count);
-                    frames_in_files += frame_count;
-                    let _ = fs::remove_file(&path);
-                }
-            }
-            
-            // Clean up frames.log and get timestamp range
-            let frames_log_path = display_dir.join("frames.log");
-            if frames_log_path.exists() {
-                println!("  Cleaning frames.log, removing {} frames", frames_in_files);
-                
-                // Get timestamp range before removing lines
-                if let Some((start, end)) = self.get_timestamp_range(&frames_log_path, frames_in_files) {
-                    match latest_timestamp_range {
-                        None => latest_timestamp_range = Some((start, end)),
-                        Some((curr_start, curr_end)) => {
-                            latest_timestamp_range = Some((
-                                curr_start.min(start),
-                                curr_end.max(end)
-                            ));
-                        }
-                    }
-                    println!("    Frame timestamp range: {} to {}", start, end);
-                }
-                
-                self.clean_log_file_by_lines(&frames_log_path, frames_in_files);
-            }
-        }
-
-        // Clean up event logs based on timestamp range
-        if let Some((start_time, end_time)) = latest_timestamp_range {
-            println!("\nCleaning event logs for timestamp range {} to {}", start_time, end_time);
-            
-            let keypress_log_path = self.session_dir.join("keypresses.log");
-            let mouse_log_path = self.session_dir.join("mouse.log");
-            
-            println!("  Cleaning keypresses.log");
-            self.clean_log_file_by_timestamp_range(&keypress_log_path, start_time, end_time);
-            println!("  Cleaning mouse.log");
-            self.clean_log_file_by_timestamp_range(&mouse_log_path, start_time, end_time);
-        } else {
-            println!("\nNo timestamp range found, skipping event log cleanup");
-        }
-
-        println!("\nRestarting all threads and logs...");
-
-        // First stop all threads
-        for (flag, handle) in self.capture_threads.drain(..) {
-            flag.store(false, Ordering::SeqCst);
-            let _ = handle.join();
-        }
-
-        // Stop event thread
-        if let Some(event_thread) = self.event_thread.take() {
-            let start = Instant::now();
-            let timeout = Duration::from_secs(5);
-            while start.elapsed() < timeout {
-                if event_thread.is_finished() {
-                    let _ = event_thread.join();
-                    break;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-
-        // Recreate log files
-        let keypress_log_path = self.session_dir.join("keypresses.log");
-        let mouse_log_path = self.session_dir.join("mouse.log");
-        
-        // Replace the log files with new ones
-        if let Ok(file) = File::create(&keypress_log_path) {
-            self.keypress_log = Arc::new(Mutex::new(BufWriter::new(file)));
-        }
-        if let Ok(file) = File::create(&mouse_log_path) {
-            self.mouse_log = Arc::new(Mutex::new(BufWriter::new(file)));
-        }
-
-        // Clear pressed keys
-        if let Ok(mut keys) = self.pressed_keys.lock() {
-            keys.clear();
-        }
-
-        // Restart event thread
-        let sr_clone_el = self.should_run.clone();
-        let kp_log = self.keypress_log.clone();
-        let m_log = self.mouse_log.clone();
-        let keys = self.pressed_keys.clone();
-        let restart_tx = self.restart_tx.clone();
-        self.event_thread = Some(thread::spawn(move || {
-            platform::unified_event_listener_thread(sr_clone_el, kp_log, m_log, keys, restart_tx)
-        }));
-
-        // Restart capture threads
-        for display in self.displays.clone() {
-            self.start_capture_for_display(display);
-        }
-
-        println!("Restart complete!\n");
-    }
-
     fn start_capture_for_display(&mut self, display: DisplayInfo) {
         let sr_for_thread = Arc::new(AtomicBool::new(true));
         let sr_clone = sr_for_thread.clone();
@@ -417,11 +153,6 @@ impl Session {
 }
 
 fn main() -> Result<()> {
-    // Clear terminal window
-    print!("\x1B[2J\x1B[1;1H");
-    std::io::stdout().flush().unwrap();
-
-    // Log ffmpeg path once at startup
     let ffmpeg_path = get_ffmpeg_path();
     println!("Using ffmpeg at: {}", ffmpeg_path.display());
 
@@ -452,10 +183,6 @@ fn main() -> Result<()> {
                 session.start();
 
                 while should_run.load(Ordering::SeqCst) {
-                    if session.check_for_restart() {
-                        session.handle_restart();
-                    }
-
                     let need_restart = session.check_for_errors();
                     if need_restart {
                         println!("Session signaled a critical error. Restarting session.");
@@ -579,10 +306,25 @@ fn capture_display_thread(
     };
     let mut frames_log = BufWriter::new(frames_log_file);
     
+    let segment_metadata_path = display_dir.join("segment_metadata.log");
+    let segment_metadata_file = match File::create(&segment_metadata_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to create segment metadata file: {}", e);
+            return;
+        }
+    };
+    let mut segment_metadata = BufWriter::new(segment_metadata_file);
+
+    // Track frames for each 60-second chunk
+    let mut frames_in_segment = 0;
+    let mut segment_start_time = Instant::now();
+    let mut segment_start_str = Local::now().format("%Y%m%d_%H%M%S").to_string();
+
     while should_run.load(Ordering::SeqCst) {
         let (tx, rx) = mpsc::channel();
         let capturer_clone = capturer.clone();
-
+        
         thread::spawn(move || {
             if let Ok(c) = capturer_clone.lock() {
                 let frame = c.get_next_frame();
@@ -592,9 +334,32 @@ fn capture_display_thread(
 
         match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(Frame::YUVFrame(frame))) => {
+                // Increment frame count for this segment
+                frames_in_segment += 1;
+
                 if let Err(e) = write_frame(&mut ffmpeg_stdin, &frame, &mut frames_log) {
                     eprintln!("Write error for display {}: {}", display_info.id, e);
                     break;
+                }
+
+                // Check if 60 seconds have elapsed; if so, log the current segment
+                if segment_start_time.elapsed() >= Duration::from_secs(60) {
+                    let segment_end_str = Local::now().format("%Y%m%d_%H%M%S").to_string();
+                    if let Err(e) = writeln!(
+                        segment_metadata,
+                        "Segment from {} to {}: {} frames",
+                        segment_start_str,
+                        segment_end_str,
+                        frames_in_segment
+                    ) {
+                        eprintln!("Failed to write to segment metadata file: {}", e);
+                    }
+                    let _ = segment_metadata.flush();
+                    
+                    // Reset for the next segment
+                    frames_in_segment = 0;
+                    segment_start_time = Instant::now();
+                    segment_start_str = segment_end_str;
                 }
             }
             Ok(Ok(_)) => {}
@@ -605,15 +370,29 @@ fn capture_display_thread(
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                eprintln!("Frame timeout on display {}", display_info.id);
-                handle_capture_error(&error_tx);
-                break;
+                eprintln!("Frame timeout on display {} - ignoring due to idle display", display_info.id);
+                continue;
             }
             Err(e) => {
                 eprintln!("Channel error on display {}: {}", display_info.id, e);
                 break;
             }
         }
+    }
+
+    // After the loop, if some frames haven't been logged, flush them out
+    if frames_in_segment > 0 {
+        let segment_end_str = Local::now().format("%Y%m%d_%H%M%S").to_string();
+        if let Err(e) = writeln!(
+            segment_metadata,
+            "Segment from {} to {}: {} frames (session ended or error)",
+            segment_start_str,
+            segment_end_str,
+            frames_in_segment
+        ) {
+            eprintln!("Failed to write final segment info to metadata file: {}", e);
+        }
+        let _ = segment_metadata.flush();
     }
 
     drop(ffmpeg_stdin);
