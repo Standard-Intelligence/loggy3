@@ -276,14 +276,12 @@ fn capture_display_thread(
         }
     };
 
-    // Just redirect stdout to /dev/null since we don't need it
     if let Some(stdout) = ffmpeg_child.stdout.take() {
         thread::spawn(move || {
             let _ = std::io::copy(&mut BufReader::new(stdout), &mut std::io::sink());
         });
     }
 
-    // Print any error messages from ffmpeg
     if let Some(stderr) = ffmpeg_child.stderr.take() {
         let display_id = display_info.id;
         thread::spawn(move || {
