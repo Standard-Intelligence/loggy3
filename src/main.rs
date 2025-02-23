@@ -306,25 +306,10 @@ fn capture_display_thread(
     };
     let mut frames_log = BufWriter::new(frames_log_file);
     
-    let segment_metadata_path = display_dir.join("segment_metadata.log");
-    let segment_metadata_file = match File::create(&segment_metadata_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Failed to create segment metadata file: {}", e);
-            return;
-        }
-    };
-    let mut segment_metadata = BufWriter::new(segment_metadata_file);
-
-    // Track frames for each 60-second chunk
-    let mut frames_in_segment = 0;
-    let mut segment_start_time = Instant::now();
-    let mut segment_start_str = Local::now().format("%Y%m%d_%H%M%S").to_string();
-
     while should_run.load(Ordering::SeqCst) {
         let (tx, rx) = mpsc::channel();
         let capturer_clone = capturer.clone();
-        
+
         thread::spawn(move || {
             if let Ok(c) = capturer_clone.lock() {
                 let frame = c.get_next_frame();
@@ -334,32 +319,9 @@ fn capture_display_thread(
 
         match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(Frame::YUVFrame(frame))) => {
-                // Increment frame count for this segment
-                frames_in_segment += 1;
-
                 if let Err(e) = write_frame(&mut ffmpeg_stdin, &frame, &mut frames_log) {
                     eprintln!("Write error for display {}: {}", display_info.id, e);
                     break;
-                }
-
-                // Check if 60 seconds have elapsed; if so, log the current segment
-                if segment_start_time.elapsed() >= Duration::from_secs(60) {
-                    let segment_end_str = Local::now().format("%Y%m%d_%H%M%S").to_string();
-                    if let Err(e) = writeln!(
-                        segment_metadata,
-                        "Segment from {} to {}: {} frames",
-                        segment_start_str,
-                        segment_end_str,
-                        frames_in_segment
-                    ) {
-                        eprintln!("Failed to write to segment metadata file: {}", e);
-                    }
-                    let _ = segment_metadata.flush();
-                    
-                    // Reset for the next segment
-                    frames_in_segment = 0;
-                    segment_start_time = Instant::now();
-                    segment_start_str = segment_end_str;
                 }
             }
             Ok(Ok(_)) => {}
@@ -378,21 +340,6 @@ fn capture_display_thread(
                 break;
             }
         }
-    }
-
-    // After the loop, if some frames haven't been logged, flush them out
-    if frames_in_segment > 0 {
-        let segment_end_str = Local::now().format("%Y%m%d_%H%M%S").to_string();
-        if let Err(e) = writeln!(
-            segment_metadata,
-            "Segment from {} to {}: {} frames (session ended or error)",
-            segment_start_str,
-            segment_end_str,
-            frames_in_segment
-        ) {
-            eprintln!("Failed to write final segment info to metadata file: {}", e);
-        }
-        let _ = segment_metadata.flush();
     }
 
     drop(ffmpeg_stdin);
@@ -456,7 +403,7 @@ fn initialize_ffmpeg(
     width: usize,
     height: usize,
 ) -> Result<(Child, ChildStdin)> {
-    let output_path = display_dir.join("output_%Y%m%d_%H%M%S.mp4");
+    let output_path = display_dir.join("chunk_%05d.mp4");
     let output_str = output_path.to_string_lossy().to_string();
 
     let ffmpeg_path = get_ffmpeg_path();
@@ -476,7 +423,6 @@ fn initialize_ffmpeg(
             "-f", "segment",
             "-segment_time", "60",
             "-reset_timestamps", "1",
-            "-strftime", "1",
             "-loglevel", "error",
             &output_str,
         ])
