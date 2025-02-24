@@ -247,7 +247,7 @@ impl Session {
         let session_dir = home_dir.join(format!("loggy3/session_{}", timestamp));
         create_dir_all(&session_dir)?;
 
-        println!("\n{}", "=== Starting new recording session ===".bright_blue().bold());
+        println!("\n{}", "=== Starting new recording session ===".cyan().bold());
         println!("Session directory: {}", session_dir.display().to_string().cyan());
         println!("{} {}", "Found".bright_white(), format!("{} display(s) to record:", displays.len()).bright_white());
         for display in &displays {
@@ -257,7 +257,7 @@ impl Session {
                 display.capture_height.to_string().yellow()
             );
         }
-        println!("{}\n", "=====================================".bright_blue());
+        println!("{}\n", "=====================================".cyan());
 
         let json_path = session_dir.join("display_info.json");
         let mut f = File::create(&json_path)?;
@@ -371,6 +371,7 @@ pub fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Check Input Monitoring by attempting to create an event tap
     print!("Input Monitoring Permission: ");
     let test_tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -551,8 +552,6 @@ fn capture_display_thread(
     let mut frame_count = 0;
     let mut last_status = Instant::now();
     
-    print!("\n");
-    
     while should_run.load(Ordering::SeqCst) {
         let (tx, rx) = mpsc::channel();
         let capturer_clone = capturer.clone();
@@ -570,15 +569,16 @@ fn capture_display_thread(
             
                 if last_status.elapsed() >= Duration::from_secs(5) {
                     let fps = frame_count as f64 / start_time.elapsed().as_secs_f64();
-                    print!("\x1B[s");
-                    print!("\x1B[{}A", display_info.id);
-                    print!("\r{}: Recording at {} fps{}",
+
+                    // Overwrite the same line: "\r\x1b[2K" resets and clears the current line
+                    print!("\r\x1b[2KDisplay {}: Recording at {} fps", 
                         display_info.title.cyan(),
-                        format!("{:.1}", fps).bright_green(),
-                        " ".repeat(20)
+                        format!("{:.1}", fps).bright_green()
                     );
-                    print!("\x1B[u");
+
+                    // Flush to ensure the line appears immediately
                     std::io::stdout().flush().unwrap();
+
                     last_status = Instant::now();
                 }
                 
@@ -595,6 +595,7 @@ fn capture_display_thread(
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // eprintln!("Frame timeout on display {} - ignoring due to idle display", display_info.id);
                 continue;
             }
             Err(e) => {
@@ -669,6 +670,7 @@ fn download_ffmpeg() -> Result<PathBuf> {
         
         pb.finish_with_message("Download complete");
         
+        // Make the binary executable
         use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(&ffmpeg_path)?.permissions();
         perms.set_mode(0o755);
@@ -679,10 +681,34 @@ fn download_ffmpeg() -> Result<PathBuf> {
 }
 
 fn get_ffmpeg_path() -> PathBuf {
+    // First try to get/download our bundled ffmpeg
     if let Ok(ffmpeg_path) = download_ffmpeg() {
         return ffmpeg_path;
     }
     
+    // Fall back to system paths if download fails
+    let ffmpeg_paths = vec![
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+    ];
+
+    for path in ffmpeg_paths {
+        let path_buf = PathBuf::from(path);
+        if path_buf.exists() {
+            return path_buf;
+        }
+    }
+    
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(app_bundle) = exe_path.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+            let bundled_ffmpeg = app_bundle.join("Contents/Frameworks/ffmpeg");
+            if bundled_ffmpeg.exists() {
+                return bundled_ffmpeg;
+            }
+        }
+    }
+
     PathBuf::from("ffmpeg")
 }
 
