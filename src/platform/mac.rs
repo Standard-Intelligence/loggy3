@@ -416,7 +416,7 @@ pub fn main() -> Result<()> {
         
         println!("\n{}", "Press Ctrl-C to stop recording...".bright_yellow());
         rx.recv().expect("Could not receive from channel.");
-        println!("\n{}", "Stopping recording...".yellow()); 
+        println!("\n{}", "Stopping recording, wait a few seconds...".yellow()); 
         
         sr_for_signals.store(false, Ordering::SeqCst);
     });
@@ -665,33 +665,27 @@ fn download_ffmpeg() -> Result<PathBuf> {
     
     if !ffmpeg_path.exists() {
         println!("Downloading ffmpeg binary...");
-        let resp = ureq::get("https://publicr2.standardinternal.com/ffmpeg_binaries/macos_arm/ffmpeg")
-            .call()
-            .context("Failed to download ffmpeg")?;
-            
-        let len = resp.header("content-length")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-            
-        let pb = ProgressBar::new(len);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-            .unwrap()
-            .progress_chars("#>-"));
-            
-        let mut file = File::create(&ffmpeg_path)?;
-        let mut reader = resp.into_reader();
-        let mut buffer = [0; 8192];
         
-        while let Ok(n) = reader.read(&mut buffer) {
-            if n == 0 { break; }
-            file.write_all(&buffer[..n])?;
-            pb.inc(n as u64);
+        let temp_path = loggy_dir.join("ffmpeg.downloading");
+        
+        let command = format!(
+            "curl -L -o {} https://publicr2.standardinternal.com/ffmpeg_binaries/macos_arm/ffmpeg",
+            temp_path.display()
+        );
+        
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .status()
+            .context("Failed to execute curl command")?;
+            
+        if !status.success() {
+            return Err(anyhow::anyhow!("Failed to download ffmpeg binary"));
         }
         
-        pb.finish_with_message("Download complete");
+        std::fs::rename(&temp_path, &ffmpeg_path)?;
+        println!("Download complete");
         
-        // Make the binary executable
         use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(&ffmpeg_path)?.permissions();
         perms.set_mode(0o755);
@@ -702,12 +696,10 @@ fn download_ffmpeg() -> Result<PathBuf> {
 }
 
 fn get_ffmpeg_path() -> PathBuf {
-    // First try to get/download our bundled ffmpeg
     if let Ok(ffmpeg_path) = download_ffmpeg() {
         return ffmpeg_path;
     }
     
-    // Fall back to system paths if download fails
     let ffmpeg_paths = vec![
         "/opt/homebrew/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
