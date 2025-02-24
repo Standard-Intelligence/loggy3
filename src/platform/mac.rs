@@ -552,6 +552,9 @@ fn capture_display_thread(
     let mut frame_count = 0;
     let mut last_status = Instant::now();
     
+    // Save the initial cursor position for this display
+    print!("\n");  // Create a new line for this display's status
+    
     while should_run.load(Ordering::SeqCst) {
         let (tx, rx) = mpsc::channel();
         let capturer_clone = capturer.clone();
@@ -569,10 +572,16 @@ fn capture_display_thread(
             
                 if last_status.elapsed() >= Duration::from_secs(5) {
                     let fps = frame_count as f64 / start_time.elapsed().as_secs_f64();
-                    println!("Display {}: Recording at {} fps", 
+                    // Move cursor up to the last line, then back down to this display's position
+                    print!("\x1B[s");  // Save cursor position
+                    print!("\x1B[{}A", display_info.id);  // Move up by display_id lines
+                    print!("\r{}: Recording at {} fps{}",
                         display_info.title.cyan(),
-                        format!("{:.1}", fps).bright_green()
+                        format!("{:.1}", fps).bright_green(),
+                        " ".repeat(20) // Add padding to clear any previous longer text
                     );
+                    print!("\x1B[u");  // Restore cursor position
+                    std::io::stdout().flush().unwrap();
                     last_status = Instant::now();
                 }
                 
@@ -589,7 +598,7 @@ fn capture_display_thread(
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                eprintln!("Frame timeout on display {} - ignoring due to idle display", display_info.id);
+                // eprintln!("Frame timeout on display {} - ignoring due to idle display", display_info.id);
                 continue;
             }
             Err(e) => {
