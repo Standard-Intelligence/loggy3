@@ -4,7 +4,7 @@ use dirs;
 use ctrlc::set_handler;
 use std::{
     fs::{create_dir_all, File},
-    io::{BufWriter, Write, BufReader, BufRead, Read},
+    io::{BufWriter, Write, BufReader, BufRead},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -28,7 +28,6 @@ use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
 use rdev::{listen, Event, EventType};
 
 use serde::{Deserialize, Serialize};
-use indicatif::{ProgressBar, ProgressStyle};
 use colored::*;
 
 pub static FFMPEG_ENCODER: &str = "h264_videotoolbox";

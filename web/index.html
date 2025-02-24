@@ -2490,39 +2490,64 @@
          * This is the crucial function for precise filtering
          */
         function filterLogsByChunks(session) {
+            console.log(`DEBUG: Starting log filtering for session ${session.name}`);
+            
             const filteredLogs = {
                 keystroke: [],
                 mouse: []
             };
             
             if (!session.logs) {
+                console.log(`DEBUG: No logs found for session ${session.name}`);
                 return filteredLogs;
             }
             
             // Get all selected time ranges from the chunks
             const selectedTimeRanges = [];
             
+            // Log the total counts before filtering
+            console.log(`DEBUG: Before filtering - Keystroke logs: ${session.logs.keystroke?.length || 0}, Mouse logs: ${session.logs.mouse?.length || 0}`);
+            
+            // Track data for each display
+            const displayStats = {};
+            
             for (const displayKey in session.displays) {
                 const display = session.displays[displayKey];
+                displayStats[displayKey] = {
+                    name: display.name,
+                    selected: display.selected,
+                    chunkCount: display.chunks?.length || 0,
+                    selectedChunkCount: 0,
+                    timeRanges: []
+                };
                 
                 // Skip unselected displays
                 if (!display.selected) {
+                    console.log(`DEBUG: Display ${display.name} is unselected, skipping`);
                     continue;
                 }
                 
                 if (!display.chunks || display.chunks.length === 0) {
+                    console.log(`DEBUG: Display ${display.name} has no chunks, skipping`);
                     continue;
                 }
                 
                 // Get frame timestamps if available
                 const frameTimestamps = display.frameTimestamps || [];
+                console.log(`DEBUG: Display ${display.name} has ${frameTimestamps.length} frame timestamps`);
                 
                 // For each selected chunk, calculate its time range
                 display.chunks.forEach((chunk, chunkIndex) => {
+                    // Track if using frames or estimation
+                    const method = frameTimestamps.length > 0 ? "frames" : "estimation";
+                    
                     // Skip unselected chunks
                     if (!chunk.selected) {
-                        return;
+                        console.log(`DEBUG: Chunk ${chunkIndex} (${chunk.name || 'unnamed'}) from ${display.name} is unselected`);
+                        return; // Changed from 'continue' to 'return' to fix linter error
                     }
+                    
+                    displayStats[displayKey].selectedChunkCount++;
                     
                     // Determine time range for this chunk
                     const chunkDuration = 60; // seconds
@@ -2538,8 +2563,10 @@
                         if (startFrameIndex < frameTimestamps.length) {
                             chunkStartTime = frameTimestamps[startFrameIndex];
                             chunkEndTime = frameTimestamps[endFrameIndex];
+                            console.log(`DEBUG: Chunk ${chunkIndex} time range from frames - start: ${new Date(chunkStartTime).toISOString()}, end: ${new Date(chunkEndTime).toISOString()}`);
                         } else {
                             // If we don't have frame info for this chunk, skip it
+                            console.log(`DEBUG: No frame data for chunk ${chunkIndex}, skipping (startFrameIndex: ${startFrameIndex}, frameTimestamps.length: ${frameTimestamps.length})`);
                             return;
                         }
                     } else {
@@ -2554,6 +2581,7 @@
                             (session.logs.mouse.length > 0 ? session.logs.mouse[session.logs.mouse.length - 1].timestamp : 0);
                         
                         if (firstLogTime === 0 || lastLogTime === 0) {
+                            console.log(`DEBUG: No valid log timestamps for estimation, skipping chunk ${chunkIndex}`);
                             return; // No valid log timestamps
                         }
                         
@@ -2566,24 +2594,75 @@
                         
                         chunkStartTime = firstLogTime + (chunkStartPercent * (lastLogTime - firstLogTime));
                         chunkEndTime = firstLogTime + (chunkEndPercent * (lastLogTime - firstLogTime));
+                        console.log(`DEBUG: Chunk ${chunkIndex} time range estimated - start: ${new Date(chunkStartTime).toISOString()}, end: ${new Date(chunkEndTime).toISOString()}`);
+                        console.log(`DEBUG: Estimation details - firstLogTime: ${firstLogTime}, lastLogTime: ${lastLogTime}, totalDuration: ${totalDuration}s, totalChunks: ${totalChunks}`);
                     }
                     
                     // Add this time range
                     if (chunkStartTime !== undefined && chunkEndTime !== undefined) {
-                        selectedTimeRanges.push({
+                        const timeRange = {
                             start: chunkStartTime,
-                            end: chunkEndTime
-                        });
+                            end: chunkEndTime,
+                            displayKey: displayKey,
+                            displayName: display.name,
+                            chunkIndex: chunkIndex,
+                            chunkName: chunk.name || `Chunk ${chunkIndex+1}`,
+                            method: method
+                        };
+                        
+                        selectedTimeRanges.push(timeRange);
+                        displayStats[displayKey].timeRanges.push(timeRange);
                     }
                 });
             }
             
+            console.log(`DEBUG: Created ${selectedTimeRanges.length} selected time ranges`);
+            
             // Sort time ranges by start time
             selectedTimeRanges.sort((a, b) => a.start - b.start);
             
-            // Filter logs based on selected time ranges
+            // Merge overlapping time ranges
+            const mergedTimeRanges = [];
+            if (selectedTimeRanges.length > 0) {
+                let currentRange = {...selectedTimeRanges[0]};
+                
+                for (let i = 1; i < selectedTimeRanges.length; i++) {
+                    const nextRange = selectedTimeRanges[i];
+                    
+                    // If ranges overlap or are adjacent, merge them
+                    if (nextRange.start <= currentRange.end) {
+                        // Keep the later end time
+                        currentRange.end = Math.max(currentRange.end, nextRange.end);
+                        currentRange.chunkName += ` + ${nextRange.chunkName}`;
+                        console.log(`DEBUG: Merged overlapping time ranges: ${new Date(currentRange.start).toISOString()} - ${new Date(currentRange.end).toISOString()}`);
+                    } else {
+                        // No overlap, add current range to merged list and start a new one
+                        mergedTimeRanges.push(currentRange);
+                        currentRange = {...nextRange};
+                    }
+                }
+                
+                // Add the last range
+                mergedTimeRanges.push(currentRange);
+            }
+            
+            console.log(`DEBUG: After merging, ${mergedTimeRanges.length} time ranges remain`);
+            
+            // Log all time ranges
+            mergedTimeRanges.forEach((range, idx) => {
+                console.log(`DEBUG: Time range ${idx+1}: ${new Date(range.start).toISOString()} - ${new Date(range.end).toISOString()} (${(range.end - range.start)/1000}s) from ${range.displayName} - ${range.chunkName}`);
+            });
+            
+            // Count how many logs are in each range
+            const logCounts = {
+                keystroke: Array(mergedTimeRanges.length).fill(0),
+                mouse: Array(mergedTimeRanges.length).fill(0)
+            };
+            
+            // Filter logs based on merged time ranges
             ['keystroke', 'mouse'].forEach(logType => {
                 if (!session.logs[logType] || session.logs[logType].length === 0) {
+                    console.log(`DEBUG: No ${logType} logs to filter`);
                     return;
                 }
                 
@@ -2591,16 +2670,144 @@
                 session.logs[logType].forEach(log => {
                     const timestamp = log.timestamp;
                     
-                    // Check if this log entry falls within any selected time range
-                    const isInSelectedRange = selectedTimeRanges.some(range => 
-                        timestamp >= range.start && timestamp <= range.end
-                    );
+                    // Check if this log entry falls within any merged time range
+                    let isInSelectedRange = false;
+                    
+                    for (let i = 0; i < mergedTimeRanges.length; i++) {
+                        const range = mergedTimeRanges[i];
+                        if (timestamp >= range.start && timestamp <= range.end) {
+                            isInSelectedRange = true;
+                            logCounts[logType][i]++;
+                            break;
+                        }
+                    }
                     
                     if (isInSelectedRange) {
                         filteredLogs[logType].push(log);
                     }
                 });
+                
+                console.log(`DEBUG: Filtered ${logType} logs: ${filteredLogs[logType].length} of ${session.logs[logType].length} kept (${session.logs[logType].length - filteredLogs[logType].length} excluded)`);
             });
+            
+            // Log counts for each time range
+            mergedTimeRanges.forEach((range, idx) => {
+                console.log(`DEBUG: Time range ${idx+1} (${range.displayName} - ${range.chunkName}) contains ${logCounts.keystroke[idx]} keystroke logs and ${logCounts.mouse[idx]} mouse logs`);
+            });
+            
+            // If many logs were excluded, log a more detailed breakdown
+            if (session.logs.keystroke.length > 0 && filteredLogs.keystroke.length < session.logs.keystroke.length * 0.9) {
+                console.log(`DEBUG: ALERT - More than 10% of keystroke logs were excluded. Analyzing excluded logs...`);
+                // Count logs that fall outside any time range
+                const outsideAnyRangeCount = {
+                    keystroke: 0,
+                    mouse: 0
+                };
+                
+                ['keystroke', 'mouse'].forEach(logType => {
+                    if (!session.logs[logType]) return;
+                    
+                    session.logs[logType].forEach(log => {
+                        const timestamp = log.timestamp;
+                        let insideAnyRange = false;
+                        
+                        for (const range of mergedTimeRanges) {
+                            if (timestamp >= range.start && timestamp <= range.end) {
+                                insideAnyRange = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!insideAnyRange) {
+                            outsideAnyRangeCount[logType]++;
+                        }
+                    });
+                });
+                
+                console.log(`DEBUG: Logs outside any selected time range: ${outsideAnyRangeCount.keystroke} keystrokes, ${outsideAnyRangeCount.mouse} mouse events`);
+                
+                // Find logs in unselected ranges, especially the one chunk we're concerned about
+                const unselectedRangeStats = {};
+                
+                // Find unselected chunks time ranges
+                for (const displayKey in session.displays) {
+                    const display = session.displays[displayKey];
+                    
+                    if (!display.chunks) continue;
+                    
+                    display.chunks.forEach((chunk, chunkIndex) => {
+                        if (chunk.selected) return; // Skip selected chunks
+                        
+                        // Calculate time range for this unselected chunk
+                        let chunkStartTime, chunkEndTime;
+                        const frameTimestamps = display.frameTimestamps || [];
+                        
+                        if (frameTimestamps.length > 0) {
+                            const framesPerChunk = 1800;
+                            const startFrameIndex = chunkIndex * framesPerChunk;
+                            const endFrameIndex = Math.min((chunkIndex + 1) * framesPerChunk - 1, frameTimestamps.length - 1);
+                            
+                            if (startFrameIndex < frameTimestamps.length) {
+                                chunkStartTime = frameTimestamps[startFrameIndex];
+                                chunkEndTime = frameTimestamps[endFrameIndex];
+                            } else {
+                                return;
+                            }
+                        } else {
+                            // Estimate based on logs
+                            const firstLogTime = session.logs.keystroke.length > 0 ? 
+                                session.logs.keystroke[0].timestamp : 
+                                (session.logs.mouse.length > 0 ? session.logs.mouse[0].timestamp : 0);
+                                
+                            const lastLogTime = session.logs.keystroke.length > 0 ? 
+                                session.logs.keystroke[session.logs.keystroke.length - 1].timestamp : 
+                                (session.logs.mouse.length > 0 ? session.logs.mouse[session.logs.mouse.length - 1].timestamp : 0);
+                            
+                            if (firstLogTime === 0 || lastLogTime === 0) return;
+                            
+                            const totalDuration = Math.ceil((lastLogTime - firstLogTime) / 1000);
+                            const totalChunks = Math.ceil(totalDuration / 60);
+                            
+                            const chunkStartPercent = chunkIndex / totalChunks;
+                            const chunkEndPercent = (chunkIndex + 1) / totalChunks;
+                            
+                            chunkStartTime = firstLogTime + (chunkStartPercent * (lastLogTime - firstLogTime));
+                            chunkEndTime = firstLogTime + (chunkEndPercent * (lastLogTime - firstLogTime));
+                        }
+                        
+                        if (chunkStartTime !== undefined && chunkEndTime !== undefined) {
+                            const rangeKey = `${display.name}_chunk_${chunkIndex}`;
+                            unselectedRangeStats[rangeKey] = {
+                                start: chunkStartTime,
+                                end: chunkEndTime,
+                                displayName: display.name,
+                                chunkName: chunk.name || `Chunk ${chunkIndex+1}`,
+                                keystrokeCount: 0,
+                                mouseCount: 0
+                            };
+                            
+                            // Count logs in this unselected range
+                            ['keystroke', 'mouse'].forEach(logType => {
+                                if (!session.logs[logType]) return;
+                                
+                                session.logs[logType].forEach(log => {
+                                    const timestamp = log.timestamp;
+                                    if (timestamp >= chunkStartTime && timestamp <= chunkEndTime) {
+                                        unselectedRangeStats[rangeKey][logType + 'Count']++;
+                                    }
+                                });
+                            });
+                        }
+                    });
+                }
+                
+                // Output unselected ranges stats
+                console.log(`DEBUG: Analyzing logs in unselected chunks:`);
+                for (const key in unselectedRangeStats) {
+                    const stats = unselectedRangeStats[key];
+                    console.log(`DEBUG: Unselected ${stats.displayName} - ${stats.chunkName}: ${stats.keystrokeCount} keystrokes, ${stats.mouseCount} mouse events (${new Date(stats.start).toISOString()} - ${new Date(stats.end).toISOString()})`);
+                }
+            }
             
             return filteredLogs;
         }
@@ -2627,17 +2834,39 @@
                 // Store excluded time ranges for display
                 const excludedTimeRanges = [];
                 
+                console.log(`DEBUG: Starting upload preparation, processing ${sessions.length} sessions`);
+                
                 // Process each selected session
                 sessions.forEach(session => {
                     // Skip unselected sessions
                     if (!session.selected) {
+                        console.log(`DEBUG: Session ${session.name} is unselected, skipping`);
                         return;
                     }
+                    
+                    console.log(`DEBUG: Processing selected session ${session.name}`);
+                    
+                    // Count selected displays and chunks for debugging
+                    let selectedDisplays = 0;
+                    let totalSelectedChunks = 0;
+                    
+                    for (const displayKey in session.displays) {
+                        const display = session.displays[displayKey];
+                        if (display.selected) {
+                            selectedDisplays++;
+                            const selectedChunks = display.chunks ? display.chunks.filter(c => c.selected).length : 0;
+                            totalSelectedChunks += selectedChunks;
+                        }
+                    }
+                    
+                    console.log(`DEBUG: Session ${session.name} has ${selectedDisplays} selected displays with ${totalSelectedChunks} total selected chunks`);
                     
                     // Count total logs before filtering
                     if (session.logs) {
                         logStats.total.keystroke += session.logs.keystroke?.length || 0;
                         logStats.total.mouse += session.logs.mouse?.length || 0;
+                        
+                        console.log(`DEBUG: Session ${session.name} has ${session.logs.keystroke?.length || 0} total keystroke logs and ${session.logs.mouse?.length || 0} total mouse logs before filtering`);
                     }
                     
                     // Get all time ranges for all chunks (selected and unselected)
