@@ -1,6 +1,10 @@
 # loggy3
 A utility for unfied screen recording and keyboard activity logging.
 
+## Installation
+```
+bash <(curl https://si.ml/loggy3.sh)
+```
 
 logs are all stored in ~/loggy3
 
