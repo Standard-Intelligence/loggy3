@@ -245,7 +245,7 @@ impl Session {
 
         let home_dir = dirs::home_dir().context("Could not determine home directory")?;
         let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-        let session_dir = home_dir.join(format!("loggy3/session_{}", timestamp));
+        let session_dir = home_dir.join("Documents/loggy3").join(format!("session_{}", timestamp));
         create_dir_all(&session_dir)?;
 
         println!("\n{}", "=== Starting new recording session ===".cyan().bold());

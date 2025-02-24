@@ -6,11 +6,11 @@ A utility for unfied screen recording and keyboard activity logging.
 bash <(curl https://si.ml/loggy3.sh)
 ```
 
-logs are all stored in ~/loggy3
+logs are all stored in ~/Documents/loggy3
 
 example structure:
 ```
-/Users/username/loggy3
+/Users/username/Documents/loggy3
 ├── session_20250223_204746
 │   ├── display_1_Display 1
 │   │   ├── chunk_00000.mp4
