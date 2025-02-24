@@ -32,6 +32,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use colored::*;
 
 pub static FFMPEG_ENCODER: &str = "h264_videotoolbox";
+pub static VERBOSE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DisplayInfo {
@@ -354,8 +355,18 @@ impl Session {
 }
 
 pub fn main() -> Result<()> {
+    // Check for verbose flag
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--verbose" || arg == "-v") {
+        VERBOSE.store(true, Ordering::SeqCst);
+    }
+
     println!("{}", "\nLoggy3 Screen Recorder".bright_green().bold());
     println!("{}", "======================".bright_green());
+
+    if VERBOSE.load(Ordering::SeqCst) {
+        println!("{}", "Verbose output enabled".yellow());
+    }
 
     // Check permissions at startup
     println!("\n{}", "Checking system permissions...".yellow());
@@ -521,8 +532,16 @@ fn capture_display_thread(
     };
 
     if let Some(stdout) = ffmpeg_child.stdout.take() {
+        let display_id = display_info.id;
         thread::spawn(move || {
-            let _ = std::io::copy(&mut BufReader::new(stdout), &mut std::io::sink());
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    if VERBOSE.load(Ordering::SeqCst) {
+                        println!("FFmpeg stdout (display {}): {}", display_id, line);
+                    }
+                }
+            }
         });
     }
 
@@ -532,7 +551,9 @@ fn capture_display_thread(
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 if let Ok(line) = line {
-                    eprintln!("FFmpeg (display {}): {}", display_id, line);
+                    if VERBOSE.load(Ordering::SeqCst) || line.contains("error") {
+                        eprintln!("FFmpeg (display {}): {}", display_id, line);
+                    }
                 }
             }
         });
@@ -722,6 +743,12 @@ fn initialize_ffmpeg(
 
     let ffmpeg_path = get_ffmpeg_path();
 
+    let log_level = if VERBOSE.load(Ordering::SeqCst) {
+        "info"
+    } else {
+        "error"
+    };
+
     let mut child = Command::new(ffmpeg_path)
         .args(&[
             "-y",
@@ -737,7 +764,7 @@ fn initialize_ffmpeg(
             "-f", "segment",
             "-segment_time", "60",
             "-reset_timestamps", "1",
-            "-loglevel", "error",
+            "-loglevel", log_level,
             &output_str,
         ])
         .stdin(Stdio::piped())
