@@ -4,7 +4,7 @@ use dirs;
 use ctrlc::set_handler;
 use std::{
     fs::{create_dir_all, File},
-    io::{BufWriter, Write, BufReader, BufRead},
+    io::{BufWriter, Write, BufReader, BufRead, Read},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -28,6 +28,8 @@ use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
 use rdev::{listen, Event, EventType};
 
 use serde::{Deserialize, Serialize};
+use indicatif::{ProgressBar, ProgressStyle};
+use colored::*;
 
 pub static FFMPEG_ENCODER: &str = "h264_videotoolbox";
 
@@ -93,6 +95,7 @@ pub fn unified_event_listener_thread(
     mouse_log: Arc<Mutex<BufWriter<File>>>,
     pressed_keys: Arc<Mutex<Vec<String>>>,
 ) {
+    println!("{}", "Starting input event logging...".green());
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
@@ -244,7 +247,17 @@ impl Session {
         let session_dir = home_dir.join(format!("loggy3/session_{}", timestamp));
         create_dir_all(&session_dir)?;
 
-        println!("Starting new session at: {}", session_dir.display());
+        println!("\n{}", "=== Starting new recording session ===".bright_blue().bold());
+        println!("Session directory: {}", session_dir.display().to_string().cyan());
+        println!("{} {}", "Found".bright_white(), format!("{} display(s) to record:", displays.len()).bright_white());
+        for display in &displays {
+            println!("- {} ({} x {})", 
+                display.title.cyan(),
+                display.capture_width.to_string().yellow(),
+                display.capture_height.to_string().yellow()
+            );
+        }
+        println!("{}\n", "=====================================".bright_blue());
 
         let json_path = session_dir.join("display_info.json");
         let mut f = File::create(&json_path)?;
@@ -341,8 +354,45 @@ impl Session {
 }
 
 pub fn main() -> Result<()> {
+    println!("{}", "\nLoggy3 Screen Recorder".bright_green().bold());
+    println!("{}", "======================".bright_green());
+
+    // Check permissions at startup
+    println!("\n{}", "Checking system permissions...".yellow());
+    
+    // Check Screen Recording permission
+    let has_screen_permission = CGDisplay::active_displays().is_ok();
+    print!("Screen Recording Permission: ");
+    if has_screen_permission {
+        println!("{}", "✓ Enabled".green());
+    } else {
+        println!("{}", "✗ Disabled".red());
+        println!("{}", "Please enable Screen Recording permission in System Settings > Privacy & Security > Screen Recording".red());
+        return Ok(());
+    }
+
+    // Check Input Monitoring by attempting to create an event tap
+    print!("Input Monitoring Permission: ");
+    let test_tap = CGEventTap::new(
+        CGEventTapLocation::HID,
+        CGEventTapPlacement::HeadInsertEventTap,
+        CGEventTapOptions::ListenOnly,
+        vec![CGEventType::MouseMoved],
+        |_, _, _| None,
+    );
+    
+    if test_tap.is_ok() {
+        println!("{}", "✓ Enabled".green());
+    } else {
+        println!("{}", "✗ Disabled".red());
+        println!("{}", "Please enable Input Monitoring permission in System Settings > Privacy & Security > Input Monitoring".red());
+        return Ok(());
+    }
+
+    println!("\n{}", "All permissions granted! Starting recorder...".green());
+
     let ffmpeg_path = get_ffmpeg_path();
-    println!("Using ffmpeg at: {}", ffmpeg_path.display());
+    println!("Using ffmpeg at: {}", ffmpeg_path.display().to_string().cyan());
 
     let should_run = Arc::new(AtomicBool::new(true));
 
@@ -353,9 +403,9 @@ pub fn main() -> Result<()> {
         set_handler(move || tx.send(()).expect("Could not send signal on channel."))
             .expect("Error setting Ctrl-C handler");
         
-        println!("Waiting for Ctrl-C...");
+        println!("\n{}", "Press Ctrl-C to stop recording...".bright_yellow());
         rx.recv().expect("Could not receive from channel.");
-        println!("Got it! Exiting..."); 
+        println!("\n{}", "Stopping recording...".yellow()); 
         
         sr_for_signals.store(false, Ordering::SeqCst);
     });
@@ -416,6 +466,12 @@ fn capture_display_thread(
     session_dir: PathBuf,
     error_tx: Sender<()>,
 ) {
+    println!("{} {} ({} x {})", 
+        "Starting capture for display".green(),
+        display_info.title.cyan(),
+        display_info.capture_width.to_string().yellow(),
+        display_info.capture_height.to_string().yellow()
+    );
     
     let targets = scap::get_all_targets().into_iter().filter(|t| matches!(t, Target::Display(_))).collect::<Vec<_>>();
     
@@ -492,6 +548,10 @@ fn capture_display_thread(
     };
     let mut frames_log = BufWriter::new(frames_log_file);
     
+    let start_time = Instant::now();
+    let mut frame_count = 0;
+    let mut last_status = Instant::now();
+    
     while should_run.load(Ordering::SeqCst) {
         let (tx, rx) = mpsc::channel();
         let capturer_clone = capturer.clone();
@@ -505,6 +565,17 @@ fn capture_display_thread(
 
         match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(Frame::YUVFrame(frame))) => {
+                frame_count += 1;
+            
+                if last_status.elapsed() >= Duration::from_secs(5) {
+                    let fps = frame_count as f64 / start_time.elapsed().as_secs_f64();
+                    println!("Display {}: Recording at {} fps", 
+                        display_info.title.cyan(),
+                        format!("{:.1}", fps).bright_green()
+                    );
+                    last_status = Instant::now();
+                }
+                
                 if let Err(e) = write_frame(&mut ffmpeg_stdin, &frame, &mut frames_log) {
                     eprintln!("Write error for display {}: {}", display_info.id, e);
                     break;
@@ -558,7 +629,58 @@ fn initialize_capturer(target: &Target) -> Option<Arc<Mutex<Capturer>>> {
     }
 }
 
+fn download_ffmpeg() -> Result<PathBuf> {
+    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
+    let loggy_dir = home_dir.join(".loggy3");
+    create_dir_all(&loggy_dir)?;
+    
+    let ffmpeg_path = loggy_dir.join("ffmpeg");
+    
+    if !ffmpeg_path.exists() {
+        println!("Downloading ffmpeg binary...");
+        let resp = ureq::get("https://publicr2.standardinternal.com/ffmpeg_binaries/macos_arm/ffmpeg")
+            .call()
+            .context("Failed to download ffmpeg")?;
+            
+        let len = resp.header("content-length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+            
+        let pb = ProgressBar::new(len);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"));
+            
+        let mut file = File::create(&ffmpeg_path)?;
+        let mut reader = resp.into_reader();
+        let mut buffer = [0; 8192];
+        
+        while let Ok(n) = reader.read(&mut buffer) {
+            if n == 0 { break; }
+            file.write_all(&buffer[..n])?;
+            pb.inc(n as u64);
+        }
+        
+        pb.finish_with_message("Download complete");
+        
+        // Make the binary executable
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&ffmpeg_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&ffmpeg_path, perms)?;
+    }
+    
+    Ok(ffmpeg_path)
+}
+
 fn get_ffmpeg_path() -> PathBuf {
+    // First try to get/download our bundled ffmpeg
+    if let Ok(ffmpeg_path) = download_ffmpeg() {
+        return ffmpeg_path;
+    }
+    
+    // Fall back to system paths if download fails
     let ffmpeg_paths = vec![
         "/opt/homebrew/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
