@@ -10,12 +10,12 @@ use anyhow::{Context, Result};
 #[cfg(target_os = "macos")]
 pub mod mac;
 #[cfg(target_os = "macos")]
-pub use mac::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT};
+pub use mac::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT};
 
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT};
+pub use windows::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT};
 
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

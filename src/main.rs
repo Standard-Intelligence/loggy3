@@ -366,18 +366,7 @@ fn capture_display_thread(
     
     let targets = scap::get_all_targets().into_iter().filter(|t| matches!(t, Target::Display(_))).collect::<Vec<_>>();
     
-    let target = match targets.iter()
-        .find(|t| match t {
-            Target::Display(d) => d.id == display_info.id,
-            _ => false
-        })
-        .cloned() {
-            Some(t) => t,
-            None => {
-                eprintln!("Could not find matching display target for ID: {}", display_info.id);
-                return;
-            }
-        };
+    let target = platform::get_target_matching_display_info(targets, display_info.clone()).unwrap();
 
     // Initialize capturer
     let capturer = match initialize_capturer(&target) {
