@@ -473,7 +473,8 @@ pub fn main() -> Result<()> {
         let _ = save_update_preferences(false);
     }
 
-    println!("{}", "\nLoggy3 Screen Recorder".bright_green().bold());
+    println!("{} {}", "\nLoggy3 Screen Recorder".bright_green().bold(), 
+              format!("v{}", CURRENT_VERSION).bright_cyan());
     println!("{}", "======================".bright_green());
 
     if VERBOSE.load(Ordering::SeqCst) {
