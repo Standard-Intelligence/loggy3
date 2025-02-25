@@ -76,5 +76,3 @@ session_[timestamp]/
 │   └── mouse.log
 └── display_info.json
 ```
-
-The `render.py` script can be used to process recordings and visualize input events.
