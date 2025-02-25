@@ -603,8 +603,7 @@ pub fn main() -> Result<()> {
     println!("\n{}", "All permissions granted! Starting recorder...".green());
 
     // Add a note about permissions being granted to Terminal
-    println!("{}", "Note: Permissions are currently granted to Terminal.app, not just the Loggy3 app.".yellow());
-    println!("{}", "      If you want to run Loggy3 outside of Terminal, you'll need to grant permissions to that app too.".yellow());
+    println!("{}", "Note: Permissions are granted to Terminal, not Loggy3 itself. Running elsewhere requires re-granting permissions.".bright_black());
 
     let ffmpeg_path = get_ffmpeg_path();
     println!("Using ffmpeg at: {}", ffmpeg_path.display().to_string().cyan());
