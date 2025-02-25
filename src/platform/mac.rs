@@ -7,7 +7,8 @@ use std::time::SystemTime;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use rdev::{listen, Event, EventType};
-use super::{LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_cache, DisplayInfo};
+use super::{LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_cache};
+use crate::DisplayInfo;
 use colored::*;
 
 #[link(name = "IOKit", kind = "framework")]

@@ -1,13 +1,21 @@
 mod platform;
+
 use anyhow::{Context, Result};
 use chrono::Local;
-use dirs;
+use colored::*;
 use ctrlc::set_handler;
+use dirs;
+use scap::{
+    capturer::{Capturer, Options, Resolution},
+    frame::{Frame, FrameType, YUVFrame},
+    Target,
+};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{create_dir_all, File},
-    io::{BufWriter, Write, BufReader, BufRead, Read},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio, exit},
+    process::{exit, Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, channel, Receiver, Sender},
@@ -15,28 +23,30 @@ use std::{
     },
     thread,
     time::{Duration, Instant, SystemTime},
-    collections::HashMap,
-};
-use scap::{
-    capturer::{Capturer, Options, Resolution},
-    frame::{Frame, FrameType, YUVFrame},
-    Target,
 };
 use sysinfo::System;
-
-use rdev::{listen, Event, EventType};
 use ureq;
 
 
-
-use serde::{Deserialize, Serialize};
-use colored::*;
-
-
-pub static VERBOSE: AtomicBool = AtomicBool::new(false);
-
+static VERBOSE: AtomicBool = AtomicBool::new(false);
 const GITHUB_REPO: &str = "Standard-Intelligence/loggy3";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DisplayInfo {
+    pub id: u32,
+    pub title: String,
+    pub is_primary: bool,
+
+    pub x: i32,
+    pub y: i32,
+
+    pub original_width: u32,
+    pub original_height: u32,
+    pub capture_width: u32,
+    pub capture_height: u32,
+}
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
@@ -56,7 +66,6 @@ struct Session {
     session_dir: PathBuf,
 
     event_thread: Option<thread::JoinHandle<()>>,
-
     capture_threads: Vec<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
 
     writer_cache: Arc<Mutex<platform::LogWriterCache>>,
@@ -65,8 +74,7 @@ struct Session {
     error_rx: Receiver<()>,
     error_tx: Sender<()>,
     
-    displays: Vec<platform::DisplayInfo>,
-    progress_threads: Vec<thread::JoinHandle<()>>,
+    displays: Vec<DisplayInfo>,
 }
 
 impl Session {
@@ -83,17 +91,7 @@ impl Session {
 
         println!("\n{}", "=== Starting new recording session ===".cyan().bold());
         println!("Session directory: {}", session_dir.display().to_string().cyan());
-        println!("{} {}", "Found".bright_white(), format!("{} display(s) to record:", displays.len()).bright_white());
-        for display in &displays {
-            println!("- {} ({} x {})", 
-                display.title.cyan(),
-                display.capture_width.to_string().yellow(),
-                display.capture_height.to_string().yellow()
-            );
-        }
-        println!("{}\n", "=====================================".cyan());
 
-        // Log session metadata (version and system info)
         if let Err(e) = log_session_metadata(&session_dir) {
             eprintln!("Warning: Failed to log session metadata: {}", e);
         }
@@ -117,19 +115,18 @@ impl Session {
             error_rx,
             error_tx,
             displays,
-            progress_threads: Vec::new(),
         }))
     }
     
     fn start(&mut self) {
-        let sr_clone_el = self.should_run.clone();
+        let should_run = self.should_run.clone();
         let writer_cache = self.writer_cache.clone();
-        let keys = self.pressed_keys.clone();
+        let pressed_keys = self.pressed_keys.clone();
         self.event_thread = Some(thread::spawn(move || {
             platform::unified_event_listener_thread_with_cache(
-                sr_clone_el,
+                should_run,
                 writer_cache,
-                keys,
+                pressed_keys,
             )
         }));
 
@@ -139,21 +136,16 @@ impl Session {
     }
 
     fn stop(self) {
+        println!("{}", "Stopping recording session...".yellow());
+
         let session_dir = self.session_dir.clone();
         
-        // Log that we're stopping the session
-        println!("{}", "Stopping recording session...".yellow());
-        
-        // Stop all capture threads first, with a timeout mechanism
         for (flag, handle) in self.capture_threads {
-            // Set should_run to false for this thread
             flag.store(false, Ordering::SeqCst);
             
-            // Wait for thread to finish with timeout
             let start = Instant::now();
             let timeout = Duration::from_secs(3);
             
-            // Try to join the thread with timeout
             while start.elapsed() < timeout {
                 if handle.is_finished() {
                     let _ = handle.join();
@@ -162,16 +154,15 @@ impl Session {
                 thread::sleep(Duration::from_millis(100));
             }
             
-            // If thread didn't finish within timeout, just log and continue
             if start.elapsed() >= timeout {
+                // TODO: I think that it never actually terminates cleanly with our current approach
                 eprintln!("Warning: Screen capture thread did not terminate cleanly within timeout");
             }
         }
 
-        // Stop event thread with a timeout
         if let Some(event_thread) = self.event_thread {
             let start = Instant::now();
-            let timeout = Duration::from_secs(5);
+            let timeout = Duration::from_secs(3);
 
             while start.elapsed() < timeout {
                 if event_thread.is_finished() {
@@ -185,11 +176,6 @@ impl Session {
                 eprintln!("Warning: Event listener thread did not terminate cleanly within timeout");
             }
         }
-
-        // Clean up any progress threads
-        for handle in self.progress_threads {
-            let _ = handle.join();
-        }
         
         println!("Session stopped: {}", session_dir.display());
     }
@@ -202,7 +188,8 @@ impl Session {
         full_restart
     }
 
-    fn start_capture_for_display(&mut self, display: platform::DisplayInfo) {
+    fn start_capture_for_display(&mut self, display: DisplayInfo) {
+        // TODO: Not sure that it really listens to the signal.
         let sr_for_thread = Arc::new(AtomicBool::new(true));
         let sr_clone = sr_for_thread.clone();
         let session_dir = self.session_dir.clone();
@@ -243,18 +230,15 @@ pub fn main() -> Result<()> {
         
         println!("Release page: {}", release_url.bright_blue().underline());
         
-        // Prompt user for action
         println!("\nWould you like to update now? [Y/n] ");
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         
         match input.trim().to_lowercase().as_str() {
             "y" | "yes" | "" => {
-                // User wants to update
                 update_to_new_version(&download_url)?;
             }
             _ => {
-                // User doesn't want to update now
                 println!("{}", "Update skipped. The application will continue to run.".yellow());
             }
         }
@@ -262,12 +246,10 @@ pub fn main() -> Result<()> {
         println!("{}", "You're running the latest version!".green());
     }
 
-    // Check permissions at startup
     println!("\n{}", "Checking system permissions...".bright_black());
-    platform::check_and_request_permissions();
-
-    let ffmpeg_path = get_ffmpeg_path();
-    println!("Using ffmpeg at: {}", ffmpeg_path.display().to_string().cyan());
+    if let Err(e) = platform::check_and_request_permissions() {
+        eprintln!("Error checking permissions: {}", e);
+    }
 
     let should_run = Arc::new(AtomicBool::new(true));
 
@@ -317,15 +299,12 @@ pub fn main() -> Result<()> {
                     thread::sleep(Duration::from_secs(1));
                 }
 
-                // Explicitly stopping the session to ensure clean shutdown
                 session.stop();
                 
-                // If we're exiting due to a global shutdown (Ctrl-C), break the outer loop
                 if !should_run.load(Ordering::SeqCst) {
                     break;
                 }
                 
-                // For display changes or errors, wait a moment before restarting
                 thread::sleep(Duration::from_secs(1));
             }
             None => {
@@ -340,20 +319,24 @@ pub fn main() -> Result<()> {
     println!("{}", "Recording stopped. Thank you for using Loggy3!".green().bold());
     Ok(())
 }
-
 fn get_display_fingerprint() -> String {
     let displays = platform::get_display_info();
-    let mut display_strings: Vec<String> = displays
-        .iter()
-        .map(|d| format!("{}:{}x{}", d.id, d.original_width, d.original_height))
-        .collect();
-    display_strings.sort();
-    display_strings.join(",")
+    match serde_json::to_string(&displays) {
+        Ok(json) => json,
+        Err(_) => {
+            let mut display_strings: Vec<String> = displays
+                .iter()
+                .map(|d| format!("{}:{}x{}", d.id, d.x, d.y))
+                .collect();
+            display_strings.sort();
+            display_strings.join(",")
+        }
+    }
 }
 
 fn capture_display_thread(
     should_run: Arc<AtomicBool>,
-    display_info: platform::DisplayInfo,
+    display_info: DisplayInfo,
     session_dir: PathBuf,
     error_tx: Sender<()>,
 ) {
@@ -379,7 +362,6 @@ fn capture_display_thread(
             }
         };
 
-    // Initialize capturer
     let capturer = match initialize_capturer(&target) {
         Some(c) => c,
         None => return,
@@ -393,14 +375,12 @@ fn capture_display_thread(
         Err(_) => return,
     };
 
-    // Initialize chunk index based on current epoch time
     let start_time_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let mut current_chunk_index = (start_time_ms / 60000) as usize;
     
-    // Create first chunk directory for this display
     let current_chunk_dir = session_dir.join(format!("chunk_{:05}", current_chunk_index));
     let display_dir = current_chunk_dir.join(format!("display_{}_{}", display_info.id, display_info.title));
     if let Err(e) = create_dir_all(&display_dir) {
@@ -408,7 +388,6 @@ fn capture_display_thread(
         return;
     }
 
-    // Set up frames log in the current chunk's display directory
     let frames_log_path = display_dir.join("frames.log");
     let frames_log_file = match File::create(&frames_log_path) {
         Ok(f) => f,
@@ -424,33 +403,25 @@ fn capture_display_thread(
     let mut chunk_frame_count = 0;
     let mut last_status = Instant::now();
     
-    // Start first ffmpeg process
     let mut ffmpeg_process = start_new_ffmpeg_process(&display_dir, width.try_into().unwrap(), height.try_into().unwrap(), display_info.id);
     if ffmpeg_process.is_none() {
         eprintln!("Failed to start initial ffmpeg process for display {}", display_info.id);
         return;
     }
     
-    // Print initial status message
     let status_indicator = format!("[Display {}]", display_info.title);
     println!("{} Started recording", status_indicator.cyan());
     
-    // How often to check for coordination signals
     let signal_check_interval = Duration::from_millis(100);
     
     while should_run.load(Ordering::SeqCst) {
-        // Try to get a frame with a short timeout
         let frame_result = {
-            // Create a time-limited attempt to get the lock
             match capturer.try_lock() {
                 Ok(capturer_guard) => {
-                    // We have the lock, get the frame
                     capturer_guard.get_next_frame().map_err(|e| anyhow::anyhow!("Frame error: {}", e))
                 },
                 Err(_) => {
-                    // Couldn't get the lock, sleep briefly and check signals
                     thread::sleep(signal_check_interval);
-                    // Return a special "busy" error that we can handle differently
                     Err(anyhow::anyhow!("Capturer busy"))
                 }
             }
@@ -461,16 +432,13 @@ fn capture_display_thread(
                 total_frame_count += 1;
                 chunk_frame_count += 1;
                 
-                // Get current timestamp
                 let current_timestamp = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
                 
-                // Calculate chunk index based on epoch time
                 let new_chunk_index = (current_timestamp / 60000) as usize;
                 
-                // Check if we need to rotate to a new chunk
                 if new_chunk_index > current_chunk_index {
                     println!("{} {}", 
                         status_indicator.cyan(),
@@ -479,22 +447,16 @@ fn capture_display_thread(
                             chunk_frame_count).yellow()
                     );
                     
-                    // Close current ffmpeg process and start a new one
                     if let Some((mut child, stdin)) = ffmpeg_process.take() {
-                        // Drop stdin first to close the pipe
                         drop(stdin);
-                        
-                        // Then wait for the child process to finish
                         if let Err(e) = child.wait() {
                             eprintln!("Error waiting for ffmpeg to complete: {}", e);
                         }
                     }
                     
-                    // Update to the new chunk index
                     current_chunk_index = new_chunk_index;
                     chunk_frame_count = 0;
                     
-                    // Create directory for the new chunk
                     let current_chunk_dir = session_dir.join(format!("chunk_{:05}", current_chunk_index));
                     let display_dir = current_chunk_dir.join(format!("display_{}_{}", display_info.id, display_info.title));
                     if let Err(e) = create_dir_all(&display_dir) {
@@ -503,7 +465,6 @@ fn capture_display_thread(
                         break;
                     }
 
-                    // Create new frames log for the new chunk
                     let frames_log_path = display_dir.join("frames.log");
                     match File::create(&frames_log_path) {
                         Ok(file) => {
@@ -532,15 +493,9 @@ fn capture_display_thread(
                 if last_status.elapsed() >= Duration::from_secs(5) {
                     let fps = total_frame_count as f64 / start_time.elapsed().as_secs_f64();
                     
-                    // Calculate seconds remaining in current chunk based on epoch time
                     let seconds_in_current_chunk = (current_timestamp % 60000) / 1000;
                     let seconds_remaining = 60 - seconds_in_current_chunk as u64;
 
-                    // Use a simple mutex for synchronizing terminal output across threads
-                    static STATUS_MUTEX: Mutex<()> = Mutex::new(());
-                    let _status_lock = STATUS_MUTEX.lock().unwrap();
-                    
-                    // Print an inline status update
                     println!("{} Recording at {} fps (chunk {}, frames: {}, seconds remaining: {})", 
                         status_indicator.cyan(),
                         format!("{:.1}", fps).bright_green(),
@@ -552,7 +507,6 @@ fn capture_display_thread(
                     last_status = Instant::now();
                 }
                 
-                // Write frame to current ffmpeg process
                 if let Some((_, ref mut stdin)) = ffmpeg_process {
                     if let Err(e) = write_frame(stdin, &frame, &mut frames_log) {
                         eprintln!("Write error for display {}: {}", display_info.id, e);
@@ -564,33 +518,20 @@ fn capture_display_thread(
                 }
             }
             Ok(_) => {
-                // Non-YUV frame, can ignore
             }
             Err(e) => {
                 let error_msg = e.to_string();
                 if error_msg.contains("Capturer busy") {
-                    // Capturer is just busy, check signals and continue
                     continue;
                 } else {
-                    // For any other error, just log and continue
-                    // If this is a persistent issue, the session manager will handle it
-                    if error_msg.contains("Timeout") || error_msg.contains("No frames available") {
-                        // These are common errors, no need to log
-                    } else {
-                        // Log uncommon errors
-                        eprintln!("Frame error on display {}: {}", display_info.id, e);
-                    }
+                    eprintln!("Frame error on display {}: {}", display_info.id, e);
                     
-                    // Check if we should still be running
                     if !should_run.load(Ordering::SeqCst) {
                         break;
                     }
                     
-                    // Sleep briefly before trying again
                     thread::sleep(signal_check_interval);
                     
-                    // Any persistent error will cause the session manager to eventually restart
-                    // Signal an error if we haven't gotten a frame for a long time
                     if total_frame_count == 0 && start_time.elapsed() > Duration::from_secs(10) {
                         eprintln!("No frames captured after 10 seconds. Signaling error.");
                         handle_capture_error(&error_tx);
@@ -602,22 +543,16 @@ fn capture_display_thread(
         }
     }
 
-    // Clean up the ffmpeg process
     if let Some((mut child, stdin)) = ffmpeg_process {
-        // Try to gracefully close the pipe
         drop(stdin);
         
-        // Wait with timeout
         let start = Instant::now();
         let timeout = Duration::from_secs(2);
         
-        // First try to see if the process is already done
         match child.try_wait() {
             Ok(Some(_)) => {
-                // Process already exited
             },
             Ok(None) => {
-                // Process still running, wait with timeout
                 let mut exited = false;
                 
                 while start.elapsed() < timeout && !exited {
@@ -626,7 +561,6 @@ fn capture_display_thread(
                             exited = true;
                         },
                         Ok(None) => {
-                            // Still running, sleep and try again
                             thread::sleep(Duration::from_millis(100));
                         },
                         Err(e) => {
@@ -636,7 +570,6 @@ fn capture_display_thread(
                     }
                 }
                 
-                // If still not exited, force kill
                 if !exited {
                     eprintln!("Timeout waiting for ffmpeg to finish - killing process");
                     let _ = child.kill();
@@ -651,18 +584,21 @@ fn capture_display_thread(
     println!("{} Recording stopped", status_indicator.cyan());
 }
 
-// Helper function to start a new ffmpeg process
 fn start_new_ffmpeg_process(
     display_dir: &std::path::Path,
     width: usize,
     height: usize,
     display_id: u32,
 ) -> Option<(Child, ChildStdin)> {
-    // Create a new ffmpeg process with single output
     let output_path = display_dir.join("video.mp4");
     let output_str = output_path.to_string_lossy().to_string();
 
-    let ffmpeg_path = get_ffmpeg_path();
+    let ffmpeg_path = if let Ok(ffmpeg_path) = download_ffmpeg() {
+        ffmpeg_path
+    } else {
+        eprintln!("Failed to download ffmpeg");
+        return None;
+    };
 
     let log_level = if VERBOSE.load(Ordering::SeqCst) {
         "info"
@@ -670,7 +606,6 @@ fn start_new_ffmpeg_process(
         "error"
     };
 
-    // Start the ffmpeg process
     let mut child = match Command::new(ffmpeg_path)
         .args(&[
             "-y",
@@ -682,7 +617,7 @@ fn start_new_ffmpeg_process(
             "-i", "pipe:0",
             "-c:v", platform::FFMPEG_ENCODER,
             "-movflags", "+frag_keyframe+empty_moov+default_base_moof+faststart",
-            "-frag_duration", "1000000",  // Fragment every 1 second
+            "-frag_duration", "1000000",
             "-g", "60",
             "-loglevel", log_level,
             &output_str,
@@ -698,7 +633,6 @@ fn start_new_ffmpeg_process(
             }
         };
 
-    // Get stdin handle
     let stdin = match child.stdin.take() {
         Some(s) => s,
         None => {
@@ -707,7 +641,6 @@ fn start_new_ffmpeg_process(
         }
     };
 
-    // Set up logging
     if let Some(stdout) = child.stdout.take() {
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -801,19 +734,15 @@ fn download_ffmpeg() -> Result<PathBuf> {
     Ok(ffmpeg_path)
 }
 
-// Check if there is a newer version available
 fn check_for_updates() -> Option<(String, String, String)> {
     let api_url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
     
     match ureq::get(&api_url).call() {
         Ok(response) => {
             if let Ok(release) = response.into_json::<GitHubRelease>() {
-                // Remove 'v' prefix if present for version comparison
                 let latest_version = release.tag_name.trim_start_matches('v').to_string();
                 
-                // Compare versions
                 if is_newer_version(&latest_version, CURRENT_VERSION) {
-                    // Find the binary asset
                     if let Some(asset) = release.assets.iter().find(|a| a.name == "loggy3") {
                         return Some((latest_version, asset.browser_download_url.clone(), release.html_url));
                     }
@@ -830,7 +759,6 @@ fn check_for_updates() -> Option<(String, String, String)> {
     None
 }
 
-// Simple version comparison (assumes semver-like versions: x.y.z)
 fn is_newer_version(new_version: &str, current_version: &str) -> bool {
     let parse_version = |v: &str| -> Vec<u32> {
         v.split('.')
@@ -852,23 +780,19 @@ fn is_newer_version(new_version: &str, current_version: &str) -> bool {
         }
     }
     
-    false  // Versions are equal
+    false
 }
 
-// Update to a newer version
 fn update_to_new_version(download_url: &str) -> Result<()> {
     println!("{}", "Downloading the latest version...".cyan());
     
-    // Get the home dir to install to
     let home_dir = dirs::home_dir().context("Could not determine home directory")?;
     let install_dir = home_dir.join(".local/bin");
     create_dir_all(&install_dir)?;
     let target_path = install_dir.join("loggy3");
     
-    // Create a temporary file for the download
     let temp_path = target_path.with_extension("new");
     
-    // Download the new version
     let response = ureq::get(download_url)
         .call()
         .context("Failed to download update")?;
@@ -878,7 +802,6 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
     response.into_reader().read_to_end(&mut buffer).context("Failed to read response")?;
     file.write_all(&buffer).context("Failed to write to temporary file")?;
     
-    // Make the new version executable
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -887,89 +810,14 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
         std::fs::set_permissions(&temp_path, perms)?;
     }
     
-    // Try direct file replacement first
     println!("{}", "Installing update...".cyan());
     
-    // On unix, we can just replace the executable directly since we have permission 
-    // to files in our own home directory
-    if let Err(e) = std::fs::rename(&temp_path, &target_path) {
-        if VERBOSE.load(Ordering::SeqCst) {
-            eprintln!("Failed to rename file directly: {}", e);
-            eprintln!("Falling back to delayed update");
-        }
-        
-        // Create a bash script to replace the executable on next run
-        let script_path = temp_path.with_extension("update.sh");
-        let script_content = format!(
-            r#"#!/bin/bash
-# Wait for 1 second
-sleep 1
-# Replace the executable
-mv "{}" "{}"
-echo "Update complete! Please run 'loggy3' to start the updated version."
-# Clean up
-rm -f "$0"
-"#,
-            temp_path.display(),
-            target_path.display()
-        );
-        
-        let mut script_file = File::create(&script_path)?;
-        script_file.write_all(script_content.as_bytes())?;
-        
-        // Make the script executable
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms)?;
-        }
-        
-        // Execute the update script
-        Command::new(&script_path).spawn()?;
-        
-        println!("{}", "Update staged! The update will complete when this program exits.".green());
-        println!("{}", "After you close this application, run 'loggy3' to start the updated version.".cyan());
-    } else {
-        println!("{}", "✓ Update installed successfully!".green());
-        println!("{}", "Please restart the application to use the new version.".cyan());
-    }
-    
-    // Exit the program after a successful update
+    std::fs::rename(&temp_path, &target_path)?;
+    println!("{}", "✓ Update installed successfully!".green());
     println!("{}", "Please restart loggy3 to use the new version.".bright_green().bold());
     exit(0);
 }
 
-fn get_ffmpeg_path() -> PathBuf {
-    if let Ok(ffmpeg_path) = download_ffmpeg() {
-        return ffmpeg_path;
-    }
-    
-    let ffmpeg_paths = vec![
-        "/opt/homebrew/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
-        "/usr/bin/ffmpeg",
-    ];
-
-    for path in ffmpeg_paths {
-        let path_buf = PathBuf::from(path);
-        if path_buf.exists() {
-            return path_buf;
-        }
-    }
-    
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(app_bundle) = exe_path.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
-            let bundled_ffmpeg = app_bundle.join("Contents/Frameworks/ffmpeg");
-            if bundled_ffmpeg.exists() {
-                return bundled_ffmpeg;
-            }
-        }
-    }
-
-    PathBuf::from("ffmpeg")
-}
 
 fn write_frame(
     ffmpeg_stdin: &mut ChildStdin,

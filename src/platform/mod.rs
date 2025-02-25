@@ -1,11 +1,10 @@
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::fs::{create_dir_all, File};
 use std::io::{BufWriter, Write};
 use colored::*;
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 #[cfg(target_os = "macos")]
 pub mod mac;
@@ -16,22 +15,6 @@ pub use mac::{get_display_info, unified_event_listener_thread_with_cache, check_
 pub mod windows;
 // #[cfg(target_os = "windows")]
 // pub use windows::{};
-
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct DisplayInfo {
-    pub id: u32,
-    pub title: String,
-    pub is_primary: bool,
-
-    pub x: i32,
-    pub y: i32,
-
-    pub original_width: u32,
-    pub original_height: u32,
-    pub capture_width: u32,
-    pub capture_height: u32,
-}
 
 pub struct LogWriterCache {
     session_dir: PathBuf,
