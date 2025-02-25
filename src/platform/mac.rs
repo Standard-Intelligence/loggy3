@@ -962,11 +962,14 @@ fn is_newer_version(new_version: &str, current_version: &str) -> bool {
 fn update_to_new_version(download_url: &str) -> Result<()> {
     println!("{}", "Downloading the latest version...".cyan());
     
-    // Get the path to the current executable
-    let current_exe = std::env::current_exe().context("Failed to get current executable path")?;
+    // Get the home dir to install to
+    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
+    let install_dir = home_dir.join(".local/bin");
+    create_dir_all(&install_dir)?;
+    let target_path = install_dir.join("loggy3");
     
     // Create a temporary file for the download
-    let temp_path = current_exe.with_extension("new");
+    let temp_path = target_path.with_extension("new");
     
     // Download the new version
     let mut response = ureq::get(download_url)
@@ -987,45 +990,57 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
         std::fs::set_permissions(&temp_path, perms)?;
     }
     
-    // Create a bash script to replace the current executable
-    let script_path = current_exe.with_extension("update.sh");
-    let script_content = format!(
-        r#"#!/bin/bash
-# Wait for the original process to exit
+    // Try direct file replacement first
+    println!("{}", "Installing update...".cyan());
+    
+    // On unix, we can just replace the executable directly since we have permission 
+    // to files in our own home directory
+    if let Err(e) = std::fs::rename(&temp_path, &target_path) {
+        if VERBOSE.load(Ordering::SeqCst) {
+            eprintln!("Failed to rename file directly: {}", e);
+            eprintln!("Falling back to delayed update");
+        }
+        
+        // Create a bash script to replace the executable on next run
+        let script_path = temp_path.with_extension("update.sh");
+        let script_content = format!(
+            r#"#!/bin/bash
+# Wait for 1 second
 sleep 1
 # Replace the executable
 mv "{}" "{}"
-# Execute the new version
-"{}" $@
-# Exit the script
-exit $?
+echo "Update complete! Please run 'loggy3' to start the updated version."
+# Clean up
+rm -f "$0"
 "#,
-        temp_path.display(),
-        current_exe.display(),
-        current_exe.display()
-    );
-    
-    let mut script_file = File::create(&script_path)?;
-    script_file.write_all(script_content.as_bytes())?;
-    
-    // Make the script executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&script_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms)?;
+            temp_path.display(),
+            target_path.display()
+        );
+        
+        let mut script_file = File::create(&script_path)?;
+        script_file.write_all(script_content.as_bytes())?;
+        
+        // Make the script executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms)?;
+        }
+        
+        // Execute the update script
+        Command::new(&script_path).spawn()?;
+        
+        println!("{}", "Update staged! The update will complete when this program exits.".green());
+        println!("{}", "After you close this application, run 'loggy3' to start the updated version.".cyan());
+    } else {
+        println!("{}", "✓ Update installed successfully!".green());
+        println!("{}", "Please restart the application to use the new version.".cyan());
     }
     
-    // Execute the update script
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let status = Command::new(script_path)
-        .args(args)
-        .spawn()?;
-    
-    // Exit the current process
-    println!("{}", "Update downloaded! Restarting application...".green());
-    exit(0);
+    // Continue running the current version
+    return Ok(());
 }
 
 // Save auto-update preferences
