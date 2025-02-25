@@ -26,12 +26,17 @@ use std::{
 };
 use sysinfo::System;
 use ureq;
+use lazy_static::lazy_static;
 
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 const GITHUB_REPO: &str = "Standard-Intelligence/loggy3";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+lazy_static! {
+    static ref FFMPEG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static ref FFMPEG_DOWNLOAD_MUTEX: Mutex<()> = Mutex::new(());
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DisplayInfo {
@@ -685,6 +690,27 @@ fn initialize_capturer(target: &Target) -> Option<Arc<Mutex<Capturer>>> {
 }
 
 fn download_ffmpeg() -> Result<PathBuf> {
+    if let Ok(ffmpeg_path_guard) = FFMPEG_PATH.lock() {
+        if let Some(path) = ffmpeg_path_guard.clone() {
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
+
+    let _download_lock = match FFMPEG_DOWNLOAD_MUTEX.lock() {
+        Ok(lock) => lock,
+        Err(e) => return Err(anyhow::anyhow!("Failed to acquire download mutex: {}", e)),
+    };
+
+    if let Ok(ffmpeg_path_guard) = FFMPEG_PATH.lock() {
+        if let Some(path) = ffmpeg_path_guard.clone() {
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
+
     let home_dir = dirs::home_dir().context("Could not determine home directory")?;
     let loggy_dir = home_dir.join(".loggy3");
     create_dir_all(&loggy_dir)?;
@@ -721,6 +747,11 @@ fn download_ffmpeg() -> Result<PathBuf> {
             perms.set_mode(0o755);
             std::fs::set_permissions(&ffmpeg_path, perms)?;
         }
+    }
+    
+    // Update the global cache with the path
+    if let Ok(mut ffmpeg_path_guard) = FFMPEG_PATH.lock() {
+        *ffmpeg_path_guard = Some(ffmpeg_path.clone());
     }
     
     Ok(ffmpeg_path)
