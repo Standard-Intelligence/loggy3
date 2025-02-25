@@ -503,19 +503,6 @@ pub fn main() -> Result<()> {
     if verbose_mode {
         VERBOSE.store(true, Ordering::SeqCst);
     }
-    
-    match load_update_preferences() {
-        Ok(disabled) => {
-            AUTO_UPDATES_DISABLED.store(disabled, Ordering::SeqCst);
-        }
-        Err(_) => {
-            // First run, auto-updates are enabled by default
-            AUTO_UPDATES_DISABLED.store(false, Ordering::SeqCst);
-            
-            // Create config file with default settings
-            let _ = save_update_preferences(false);
-        }
-    }
 
     println!("{} {}", "\nLoggy3 Screen Recorder".bright_green().bold(), 
               format!("v{}", CURRENT_VERSION).bright_cyan());
@@ -1323,41 +1310,6 @@ rm -f "$0"
     // Exit the program after a successful update
     println!("{}", "Please restart loggy3 to use the new version.".bright_green().bold());
     exit(0);
-}
-
-// Save auto-update preferences
-fn save_update_preferences(disabled: bool) -> Result<()> {
-    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
-    let config_dir = home_dir.join(".loggy3");
-    create_dir_all(&config_dir)?;
-    
-    let config_path = config_dir.join("config.json");
-    let config = serde_json::json!({
-        "auto_updates_disabled": disabled
-    });
-    
-    let file = File::create(&config_path)?;
-    serde_json::to_writer_pretty(file, &config)?;
-    
-    Ok(())
-}
-
-// Load auto-update preferences
-fn load_update_preferences() -> Result<bool> {
-    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
-    let config_path = home_dir.join(".loggy3/config.json");
-    
-    if config_path.exists() {
-        let file = File::open(&config_path)?;
-        let config: serde_json::Value = serde_json::from_reader(file)?;
-        
-        if let Some(disabled) = config.get("auto_updates_disabled").and_then(|v| v.as_bool()) {
-            return Ok(disabled);
-        }
-    }
-    
-    // Default to auto-updates enabled
-    Ok(false)
 }
 
 fn get_ffmpeg_path() -> PathBuf {
