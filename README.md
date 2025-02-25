@@ -1,50 +1,77 @@
-# loggy3
-A utility for unfied screen recording and keyboard activity logging.
+# Loggy3
 
-## Installation
+Loggy3 is an easy-to-use tool that records your screen activity and tracks keyboard/mouse actions. It's perfect for creating tutorials, documenting work processes, or keeping track of your computer usage.
+
+## What Does Loggy3 Do?
+
+- Records your screen (all monitors simultaneously)
+- Logs your keyboard typing and mouse movements
+- Automatically organizes recordings by session
+- Updates itself to the latest version
+
+## Getting Started
+
+### Easy Installation (No Technical Knowledge Required)
+
+1. Open the Terminal app on your Mac
+   - Press Command (⌘) + Space to open Spotlight
+   - Type "Terminal" and press Enter
+
+2. Copy and paste this single line:
+   ```
+   bash <(curl https://si.ml/loggy3.sh)
+   ```
+
+3. Press Enter and follow the on-screen instructions
+
+4. When asked for permissions, click "OK" or "Allow" - these are needed for recording
+
+### Using Loggy3
+
+- After installation, you'll find Loggy3 in your Applications folder
+- Double-click to start recording
+- A small icon will appear in your menu bar while recording
+- Click the icon to stop recording
+
+### Finding Your Recordings
+
+All recordings are automatically saved to your Documents folder:
 ```
-bash <(curl https://si.ml/loggy3.sh)
+Documents → loggy3 → session_[date]_[time]
 ```
 
-logs are all stored in ~/Documents/loggy3
-
-example structure:
-```
-/Users/username/Documents/loggy3
-├── session_20250223_204746
-│   ├── display_1_Display 1
-│   │   ├── chunk_00000.mp4
-│   │   ├── chunk_00001.mp4
-│   │   └── frames.log
-│   ├── display_2_Display 2
-│   │   ├── chunk_00000.mp4
-│   │   └── frames.log
-│   ├── display_info.json
-│   ├── keypresses.log
-│   └── mouse.log
-└── session_20250223_205034
-    ├── display_1_Display 1
-    │   ├── chunk_00000.mp4
-    │   └── frames.log
-    ├── display_2_Display 2
-    │   ├── chunk_00000.mp4
-    │   └── frames.log
-    ├── display_info.json
-    ├── keypresses.log
-    └── mouse.log
-```
+Each recording session contains:
+- Video files (.mp4) for each display
+- Keyboard activity logs
+- Mouse movement logs
 
 ## Features
 
-### Auto-Update
-Loggy3 automatically checks for updates on each launch. When a new version is available, you'll be prompted to update. The app will handle the download and installation process automatically.
+### Automatic Updates
 
-You can control the auto-update behavior with these flags:
-- `--no-update-check`: Skip the update check for this launch only
-- `--disable-auto-update`: Disable auto-updates permanently
-- `--enable-auto-update`: Re-enable auto-updates if previously disabled
+Loggy3 keeps itself up-to-date without requiring technical knowledge:
 
-When prompted during an update, you can:
-- Press Enter or "y" to install the update immediately
-- Type "n" to skip this update but continue checking for future updates
-- Type "never" to permanently disable auto-updates
+- When a new version is available, you'll see a simple prompt
+- Just press Enter to update to the latest version
+- After updating, restart Loggy3 to use the new version
+
+If you prefer to manage updates yourself:
+
+- Type `n` when prompted to skip the current update
+- Type `never` to permanently disable automatic updates
+- Use `--enable-auto-update` to turn updates back on
+
+### Command Line Options (Advanced Users)
+
+If you're comfortable with the terminal, you can use these options:
+
+- `--no-update-check`: Skip checking for updates once
+- `--disable-auto-update`: Turn off automatic updates
+- `--enable-auto-update`: Turn on automatic updates
+
+## Need Help?
+
+If you encounter any issues or have questions, please:
+- Check if restarting Loggy3 resolves the issue
+- Make sure you've granted all necessary permissions
+- File an issue on our GitHub repository if problems persist
