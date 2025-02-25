@@ -3,10 +3,10 @@ use chrono::Local;
 use dirs;
 use ctrlc::set_handler;
 use std::{
-    fs::{create_dir_all, File},
-    io::{BufWriter, Write, BufReader, BufRead},
+    fs::{create_dir_all, File, OpenOptions},
+    io::{BufWriter, Write, BufReader, BufRead, Read},
     path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio, exit},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, channel, Receiver, Sender},
@@ -26,6 +26,7 @@ use core_graphics::event::{CGEventTap, CGEventTapLocation, CGEventTapPlacement,
     CGEventTapOptions, CGEventType, EventField};
 use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
 use rdev::{listen, Event, EventType};
+use ureq;
 
 // Permission checking code for macOS
 // IOKit bindings for Input Monitoring permissions
@@ -89,6 +90,24 @@ use colored::*;
 
 pub static FFMPEG_ENCODER: &str = "h264_videotoolbox";
 pub static VERBOSE: AtomicBool = AtomicBool::new(false);
+pub static AUTO_UPDATES_DISABLED: AtomicBool = AtomicBool::new(false);
+
+const GITHUB_REPO: &str = "Standard-Intelligence/loggy3";
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// GitHub API response structures
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubAsset>,
+    html_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DisplayInfo {
@@ -423,9 +442,35 @@ pub fn main() -> Result<()> {
     // Check for command-line flags
     let args: Vec<String> = std::env::args().collect();
     let verbose_mode = args.iter().any(|arg| arg == "--verbose" || arg == "-v");
+    let no_update_check = args.iter().any(|arg| arg == "--no-update-check");
+    let disable_auto_update = args.iter().any(|arg| arg == "--disable-auto-update");
+    let enable_auto_update = args.iter().any(|arg| arg == "--enable-auto-update");
     
     if verbose_mode {
         VERBOSE.store(true, Ordering::SeqCst);
+    }
+    
+    // Load auto-update preferences
+    match load_update_preferences() {
+        Ok(disabled) => {
+            AUTO_UPDATES_DISABLED.store(disabled, Ordering::SeqCst);
+        }
+        Err(_) => {
+            // First run, auto-updates are enabled by default
+            AUTO_UPDATES_DISABLED.store(false, Ordering::SeqCst);
+            
+            // Create config file with default settings
+            let _ = save_update_preferences(false);
+        }
+    }
+    
+    // Override with command-line flags if provided
+    if disable_auto_update {
+        AUTO_UPDATES_DISABLED.store(true, Ordering::SeqCst);
+        let _ = save_update_preferences(true);
+    } else if enable_auto_update {
+        AUTO_UPDATES_DISABLED.store(false, Ordering::SeqCst);
+        let _ = save_update_preferences(false);
     }
 
     println!("{}", "\nLoggy3 Screen Recorder".bright_green().bold());
@@ -433,6 +478,46 @@ pub fn main() -> Result<()> {
 
     if VERBOSE.load(Ordering::SeqCst) {
         println!("{}", "Verbose output enabled".yellow());
+    }
+    
+    // Check for updates unless explicitly disabled
+    if !no_update_check && !AUTO_UPDATES_DISABLED.load(Ordering::SeqCst) {
+        println!("{}", "Checking for updates...".cyan());
+        
+        if let Some((version, download_url, release_url)) = check_for_updates() {
+            println!("{} {} {} {}", 
+                "A new version".bright_yellow(),
+                version.bright_green().bold(),
+                "is available!".bright_yellow(),
+                format!("(current: {})", CURRENT_VERSION).bright_black()
+            );
+            
+            println!("Release page: {}", release_url.bright_blue().underline());
+            
+            // Prompt user for action
+            println!("\nWould you like to update now? [Y/n/never] ");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            
+            match input.trim().to_lowercase().as_str() {
+                "y" | "yes" | "" => {
+                    // User wants to update
+                    update_to_new_version(&download_url)?;
+                }
+                "never" => {
+                    // User wants to disable auto-updates
+                    println!("{}", "Auto-updates disabled. You can re-enable them with --enable-auto-update".yellow());
+                    AUTO_UPDATES_DISABLED.store(true, Ordering::SeqCst);
+                    save_update_preferences(true)?;
+                }
+                _ => {
+                    // User doesn't want to update now
+                    println!("{}", "Update skipped. The application will continue to run.".yellow());
+                }
+            }
+        } else if VERBOSE.load(Ordering::SeqCst) {
+            println!("{}", "You're running the latest version!".green());
+        }
     }
 
     // Check permissions at startup
@@ -812,6 +897,170 @@ fn download_ffmpeg() -> Result<PathBuf> {
     }
     
     Ok(ffmpeg_path)
+}
+
+// Check if there is a newer version available
+fn check_for_updates() -> Option<(String, String, String)> {
+    // If auto-updates are disabled, return None
+    if AUTO_UPDATES_DISABLED.load(Ordering::SeqCst) {
+        return None;
+    }
+
+    let api_url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
+    
+    match ureq::get(&api_url).call() {
+        Ok(response) => {
+            if let Ok(release) = response.into_json::<GitHubRelease>() {
+                // Remove 'v' prefix if present for version comparison
+                let latest_version = release.tag_name.trim_start_matches('v').to_string();
+                
+                // Compare versions
+                if is_newer_version(&latest_version, CURRENT_VERSION) {
+                    // Find the binary asset
+                    if let Some(asset) = release.assets.iter().find(|a| a.name == "loggy3") {
+                        return Some((latest_version, asset.browser_download_url.clone(), release.html_url));
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            if VERBOSE.load(Ordering::SeqCst) {
+                eprintln!("Failed to check for updates: {}", e);
+            }
+        }
+    }
+    
+    None
+}
+
+// Simple version comparison (assumes semver-like versions: x.y.z)
+fn is_newer_version(new_version: &str, current_version: &str) -> bool {
+    let parse_version = |v: &str| -> Vec<u32> {
+        v.split('.')
+         .map(|s| s.parse::<u32>().unwrap_or(0))
+         .collect()
+    };
+    
+    let new_parts = parse_version(new_version);
+    let current_parts = parse_version(current_version);
+    
+    for i in 0..3 {
+        let new_part = new_parts.get(i).copied().unwrap_or(0);
+        let current_part = current_parts.get(i).copied().unwrap_or(0);
+        
+        if new_part > current_part {
+            return true;
+        } else if new_part < current_part {
+            return false;
+        }
+    }
+    
+    false  // Versions are equal
+}
+
+// Update to a newer version
+fn update_to_new_version(download_url: &str) -> Result<()> {
+    println!("{}", "Downloading the latest version...".cyan());
+    
+    // Get the path to the current executable
+    let current_exe = std::env::current_exe().context("Failed to get current executable path")?;
+    
+    // Create a temporary file for the download
+    let temp_path = current_exe.with_extension("new");
+    
+    // Download the new version
+    let mut response = ureq::get(download_url)
+        .call()
+        .context("Failed to download update")?;
+    
+    let mut file = File::create(&temp_path).context("Failed to create temporary file")?;
+    let mut buffer = Vec::new();
+    response.into_reader().read_to_end(&mut buffer).context("Failed to read response")?;
+    file.write_all(&buffer).context("Failed to write to temporary file")?;
+    
+    // Make the new version executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&temp_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&temp_path, perms)?;
+    }
+    
+    // Create a bash script to replace the current executable
+    let script_path = current_exe.with_extension("update.sh");
+    let script_content = format!(
+        r#"#!/bin/bash
+# Wait for the original process to exit
+sleep 1
+# Replace the executable
+mv "{}" "{}"
+# Execute the new version
+"{}" $@
+# Exit the script
+exit $?
+"#,
+        temp_path.display(),
+        current_exe.display(),
+        current_exe.display()
+    );
+    
+    let mut script_file = File::create(&script_path)?;
+    script_file.write_all(script_content.as_bytes())?;
+    
+    // Make the script executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)?;
+    }
+    
+    // Execute the update script
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let status = Command::new(script_path)
+        .args(args)
+        .spawn()?;
+    
+    // Exit the current process
+    println!("{}", "Update downloaded! Restarting application...".green());
+    exit(0);
+}
+
+// Save auto-update preferences
+fn save_update_preferences(disabled: bool) -> Result<()> {
+    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
+    let config_dir = home_dir.join(".loggy3");
+    create_dir_all(&config_dir)?;
+    
+    let config_path = config_dir.join("config.json");
+    let config = serde_json::json!({
+        "auto_updates_disabled": disabled
+    });
+    
+    let file = File::create(&config_path)?;
+    serde_json::to_writer_pretty(file, &config)?;
+    
+    Ok(())
+}
+
+// Load auto-update preferences
+fn load_update_preferences() -> Result<bool> {
+    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
+    let config_path = home_dir.join(".loggy3/config.json");
+    
+    if config_path.exists() {
+        let file = File::open(&config_path)?;
+        let config: serde_json::Value = serde_json::from_reader(file)?;
+        
+        if let Some(disabled) = config.get("auto_updates_disabled").and_then(|v| v.as_bool()) {
+            return Ok(disabled);
+        }
+    }
+    
+    // Default to auto-updates enabled
+    Ok(false)
 }
 
 fn get_ffmpeg_path() -> PathBuf {

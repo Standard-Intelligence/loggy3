@@ -42,4 +42,5 @@ fi
 
 echo " "
 echo "🚀 Running $BINARY_NAME, in the future you can run 'loggy3' directly"
+echo "ℹ️  Auto-updates are enabled by default. You can disable them using 'loggy3 --disable-auto-update'"
 "$INSTALL_DIR/$BINARY_NAME"
