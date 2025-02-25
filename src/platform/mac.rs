@@ -14,6 +14,7 @@ use std::{
     },
     thread,
     time::{Duration, Instant, SystemTime},
+    collections::HashMap,
 };
 use scap::{
     capturer::{Capturer, Options, Resolution},
@@ -124,21 +125,78 @@ pub struct DisplayInfo {
     pub capture_height: u32,
 }
 
+// Writer cache to manage log files across chunk boundaries
+pub struct LogWriterCache {
+    session_dir: PathBuf,
+    keypress_writers: HashMap<usize, Arc<Mutex<BufWriter<File>>>>,
+    mouse_writers: HashMap<usize, Arc<Mutex<BufWriter<File>>>>,
+}
 
-fn log_mouse_event(timestamp: u128, mouse_log: &Mutex<BufWriter<File>>, data: &str) {
-    let line = format!("({}, {})\n", timestamp, data);
-    if let Ok(mut writer) = mouse_log.lock() {
-        let _ = writer.write_all(line.as_bytes());
-        let _ = writer.flush();
+impl LogWriterCache {
+    fn new(session_dir: PathBuf) -> Self {
+        Self {
+            session_dir,
+            keypress_writers: HashMap::new(),
+            mouse_writers: HashMap::new(),
+        }
+    }
+
+    // Get or create a writer for keypresses based on timestamp
+    fn get_keypress_writer(&mut self, timestamp_ms: u128) -> Result<Arc<Mutex<BufWriter<File>>>> {
+        let chunk_index = (timestamp_ms / 60000) as usize;
+        if !self.keypress_writers.contains_key(&chunk_index) {
+            // Create the chunk directory if needed
+            let chunk_dir = self.session_dir.join(format!("chunk_{:05}", chunk_index));
+            create_dir_all(&chunk_dir)?;
+            
+            // Create the log file
+            let log_path = chunk_dir.join("keypresses.log");
+            let writer = Arc::new(Mutex::new(BufWriter::new(File::create(log_path)?)));
+            println!("{}", format!("Created new keypress log for chunk {}", chunk_index).yellow());
+            self.keypress_writers.insert(chunk_index, writer);
+        }
+        Ok(self.keypress_writers.get(&chunk_index).unwrap().clone())
+    }
+    
+    // Get or create a writer for mouse events based on timestamp
+    fn get_mouse_writer(&mut self, timestamp_ms: u128) -> Result<Arc<Mutex<BufWriter<File>>>> {
+        let chunk_index = (timestamp_ms / 60000) as usize;
+        if !self.mouse_writers.contains_key(&chunk_index) {
+            // Create the chunk directory if needed
+            let chunk_dir = self.session_dir.join(format!("chunk_{:05}", chunk_index));
+            create_dir_all(&chunk_dir)?;
+            
+            // Create the log file
+            let log_path = chunk_dir.join("mouse.log");
+            let writer = Arc::new(Mutex::new(BufWriter::new(File::create(log_path)?)));
+            println!("{}", format!("Created new mouse log for chunk {}", chunk_index).yellow());
+            self.mouse_writers.insert(chunk_index, writer);
+        }
+        Ok(self.mouse_writers.get(&chunk_index).unwrap().clone())
     }
 }
 
+// New function to log mouse events with automatic chunk management
+fn log_mouse_event_with_cache(timestamp: u128, cache: &Arc<Mutex<LogWriterCache>>, data: &str) {
+    let line = format!("({}, {})\n", timestamp, data);
+    
+    // Get the appropriate writer for this timestamp
+    if let Ok(mut cache_lock) = cache.lock() {
+        if let Ok(writer) = cache_lock.get_mouse_writer(timestamp) {
+            if let Ok(mut writer_lock) = writer.lock() {
+                let _ = writer_lock.write_all(line.as_bytes());
+                let _ = writer_lock.flush();
+            }
+        }
+    }
+}
 
-fn handle_key_event(
+// New function to handle key events with automatic chunk management
+fn handle_key_event_with_cache(
     is_press: bool,
     key: rdev::Key,
     timestamp: u128,
-    key_log: &Mutex<BufWriter<File>>,
+    cache: &Arc<Mutex<LogWriterCache>>,
     pressed_keys: &Mutex<Vec<String>>,
 ) {
     let key_str = format!("{:?}", key);
@@ -159,19 +217,25 @@ fn handle_key_event(
     };
 
     let line = format!("({}, '{}')\n", timestamp, state);
-    if let Ok(mut writer) = key_log.lock() {
-        let _ = writer.write_all(line.as_bytes());
-        let _ = writer.flush();
+    
+    // Get the appropriate writer for this timestamp
+    if let Ok(mut cache_lock) = cache.lock() {
+        if let Ok(writer) = cache_lock.get_keypress_writer(timestamp) {
+            if let Ok(mut writer_lock) = writer.lock() {
+                let _ = writer_lock.write_all(line.as_bytes());
+                let _ = writer_lock.flush();
+            }
+        }
     }
 }
 
-pub fn unified_event_listener_thread(
+// New unified event listener that uses the writer cache
+pub fn unified_event_listener_thread_with_cache(
     should_run: Arc<AtomicBool>,
-    keypress_log: Arc<Mutex<BufWriter<File>>>,
-    mouse_log: Arc<Mutex<BufWriter<File>>>,
+    writer_cache: Arc<Mutex<LogWriterCache>>,
     pressed_keys: Arc<Mutex<Vec<String>>>,
 ) {
-    println!("{}", "Starting input event logging...".green());
+    println!("{}", "Starting input event logging with automatic chunk rotation...".green());
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
@@ -183,7 +247,7 @@ pub fn unified_event_listener_thread(
             CGEventType::OtherMouseDragged,
         ],
         {
-            let mouse_log = mouse_log.clone();
+            let writer_cache = writer_cache.clone();
             let should_run = should_run.clone();
             move |_, event_type, event| {
                 if !should_run.load(Ordering::SeqCst) {
@@ -201,7 +265,7 @@ pub fn unified_event_listener_thread(
                     CGEventType::OtherMouseDragged => {
                         let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X);
                         let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y);
-                        log_mouse_event(timestamp, &mouse_log, &format!("{{'type': 'delta', 'deltaX': {}, 'deltaY': {}}}", dx, dy));
+                        log_mouse_event_with_cache(timestamp, &writer_cache, &format!("{{'type': 'delta', 'deltaX': {}, 'deltaY': {}}}", dx, dy));
                     }
                     _ => {}
                 }
@@ -214,8 +278,7 @@ pub fn unified_event_listener_thread(
     
     let event_thread = thread::spawn({
         let should_run = should_run.clone();
-        let keypress_log = keypress_log.clone();
-        let mouse_log = mouse_log.clone();
+        let writer_cache = writer_cache.clone();
         let pressed_keys = pressed_keys.clone();
         move || {
             match listen(move |event: Event| {
@@ -230,22 +293,22 @@ pub fn unified_event_listener_thread(
 
                 match event.event_type {
                     EventType::KeyPress(k) => {
-                        handle_key_event(true, k, timestamp, &keypress_log, &pressed_keys);
+                        handle_key_event_with_cache(true, k, timestamp, &writer_cache, &pressed_keys);
                     }
                     EventType::KeyRelease(k) => {
-                        handle_key_event(false, k, timestamp, &keypress_log, &pressed_keys);
+                        handle_key_event_with_cache(false, k, timestamp, &writer_cache, &pressed_keys);
                     }
                     EventType::MouseMove { x, y } => {
-                        log_mouse_event(timestamp, &mouse_log, &format!("{{'type': 'move', 'x': {}, 'y': {}}}", x, y));
+                        log_mouse_event_with_cache(timestamp, &writer_cache, &format!("{{'type': 'move', 'x': {}, 'y': {}}}", x, y));
                     }
                     EventType::ButtonPress(btn) => {
-                        log_mouse_event(timestamp, &mouse_log, &format!("{{'type': 'button', 'action': 'press', 'button': '{:?}'}}", btn));
+                        log_mouse_event_with_cache(timestamp, &writer_cache, &format!("{{'type': 'button', 'action': 'press', 'button': '{:?}'}}", btn));
                     }
                     EventType::ButtonRelease(btn) => {
-                        log_mouse_event(timestamp, &mouse_log, &format!("{{'type': 'button', 'action': 'release', 'button': '{:?}'}}", btn));
+                        log_mouse_event_with_cache(timestamp, &writer_cache, &format!("{{'type': 'button', 'action': 'release', 'button': '{:?}'}}", btn));
                     }
                     EventType::Wheel { delta_x, delta_y } => {
-                        log_mouse_event(timestamp, &mouse_log, &format!("{{'type': 'wheel', 'deltaX': {}, 'deltaY': {}}}", delta_x, delta_y));
+                        log_mouse_event_with_cache(timestamp, &writer_cache, &format!("{{'type': 'wheel', 'deltaX': {}, 'deltaY': {}}}", delta_x, delta_y));
                     }
                 }
             }) {
@@ -267,8 +330,6 @@ pub fn unified_event_listener_thread(
 
     let _ = event_thread.join();
 }
-
-
 
 pub fn get_display_info() -> Vec<DisplayInfo> {
     let mut results = Vec::new();
@@ -300,7 +361,6 @@ pub fn get_display_info() -> Vec<DisplayInfo> {
     results
 }
 
-
 struct Session {
     should_run: Arc<AtomicBool>,
     session_dir: PathBuf,
@@ -309,8 +369,8 @@ struct Session {
 
     capture_threads: Vec<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
 
-    keypress_log: Arc<Mutex<BufWriter<File>>>,
-    mouse_log: Arc<Mutex<BufWriter<File>>>,
+    // Replace individual log files with a writer cache
+    writer_cache: Arc<Mutex<LogWriterCache>>,
     pressed_keys: Arc<Mutex<Vec<String>>>,
 
     error_rx: Receiver<()>,
@@ -318,6 +378,10 @@ struct Session {
     
     displays: Vec<DisplayInfo>,
     progress_threads: Vec<thread::JoinHandle<()>>,
+    
+    // We still keep track of the current chunk index for display/info purposes
+    current_chunk_index: usize,
+    last_chunk_timestamp: u128,
 }
 
 impl Session {
@@ -348,10 +412,17 @@ impl Session {
         let mut f = File::create(&json_path)?;
         serde_json::to_writer_pretty(&mut f, &displays)?;
 
-        let keypress_log_path = session_dir.join("keypresses.log");
-        let mouse_log_path = session_dir.join("mouse.log");
-        let keypress_log = Arc::new(Mutex::new(BufWriter::new(File::create(keypress_log_path)?)));
-        let mouse_log = Arc::new(Mutex::new(BufWriter::new(File::create(mouse_log_path)?)));
+        // Initialize chunk index based on current epoch time
+        let current_timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        
+        // Calculate chunk number based on epoch time, in 60-second increments
+        let current_chunk_index = (current_timestamp / 60000) as usize;
+        
+        // Create the writer cache instead of individual log files
+        let writer_cache = Arc::new(Mutex::new(LogWriterCache::new(session_dir.clone())));
         let pressed_keys = Arc::new(Mutex::new(vec![]));
 
         let (error_tx, error_rx) = mpsc::channel();
@@ -361,65 +432,25 @@ impl Session {
             session_dir,
             event_thread: None,
             capture_threads: Vec::new(),
-            keypress_log,
-            mouse_log,
+            writer_cache,
             pressed_keys,
             error_rx,
             error_tx,
             displays,
             progress_threads: Vec::new(),
+            current_chunk_index: current_chunk_index,
+            last_chunk_timestamp: current_timestamp,
         }))
     }
     
-    // Check if this session has at least one complete chunk (1 minute of recording)
-    fn has_complete_chunks(&self) -> bool {
-        let mut has_chunks = false;
-        
-        // Iterate through each display directory
-        for display in &self.displays {
-            let display_dir = self.session_dir.join(format!("display_{}_{}", display.id, display.title));
-            if !display_dir.exists() {
-                continue;
-            }
-            
-            // Check if there are any chunk files
-            if let Ok(entries) = std::fs::read_dir(&display_dir) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let file_name = entry.file_name().to_string_lossy().to_string();
-                        
-                        // Check if this is a completed chunk file (not being written)
-                        if file_name.starts_with("chunk_") && file_name.ends_with(".mp4") {
-                            // Check if file size is at least 1MB (reasonable for a complete chunk)
-                            if let Ok(metadata) = entry.metadata() {
-                                if metadata.len() > 1_000_000 {  // 1MB minimum size
-                                    has_chunks = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            if has_chunks {
-                break;
-            }
-        }
-        
-        has_chunks
-    }
-
     fn start(&mut self) {
         let sr_clone_el = self.should_run.clone();
-        let kp_log = self.keypress_log.clone();
-        let m_log = self.mouse_log.clone();
+        let writer_cache = self.writer_cache.clone();
         let keys = self.pressed_keys.clone();
         self.event_thread = Some(thread::spawn(move || {
-            unified_event_listener_thread(
+            unified_event_listener_thread_with_cache(
                 sr_clone_el,
-                kp_log,
-                m_log,
+                writer_cache,
                 keys,
             )
         }));
@@ -429,10 +460,8 @@ impl Session {
         }
     }
 
-    fn stop(self, cleanup_short_sessions: bool) {
-        // Check for complete chunks before stopping threads 
-        // (we need to do this before moving any part of self)
-        let has_complete_chunks = !cleanup_short_sessions || self.has_complete_chunks();
+    fn stop(self) {
+        // No need for the cleanup_short_sessions parameter
         let session_dir = self.session_dir.clone();
         
         for (flag, handle) in self.capture_threads {
@@ -459,20 +488,6 @@ impl Session {
             let _ = handle.join();
         }
         
-        // Check if this is a short/glitched session that should be cleaned up
-        if cleanup_short_sessions && !has_complete_chunks {
-            println!("{}", "Short recording session detected - cleaning up...".yellow());
-            // Remove the session directory and all its contents
-            if let Err(e) = std::fs::remove_dir_all(&session_dir) {
-                if VERBOSE.load(Ordering::SeqCst) {
-                    eprintln!("Failed to clean up short session: {}", e);
-                }
-            } else {
-                println!("{}", "✓ Short session cleaned up".green());
-                return;
-            }
-        }
-
         println!("Session stopped: {}", session_dir.display());
     }
 
@@ -494,6 +509,26 @@ impl Session {
             capture_display_thread(sr_clone, display, session_dir, error_tx);
         });
         self.capture_threads.push((sr_for_thread, handle));
+    }
+
+    // Update the rotate_to_new_chunk method to just update tracking variables
+    // This no longer needs to create new files - the writer cache does that automatically
+    fn rotate_to_new_chunk(&mut self) -> Result<()> {
+        // Get current timestamp and calculate chunk index directly from epoch time
+        let current_timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        
+        // Calculate chunk index based on epoch time in 60-second increments
+        self.current_chunk_index = (current_timestamp / 60000) as usize;
+        
+        // Update timestamp for the new chunk
+        self.last_chunk_timestamp = current_timestamp;
+            
+        println!("{}", format!("Current chunk index is now {}", self.current_chunk_index).green());
+        
+        Ok(())
     }
 }
 
@@ -581,14 +616,14 @@ pub fn main() -> Result<()> {
     }
 
     // Check permissions at startup
-    println!("\n{}", "Checking system permissions...".yellow());
+    println!("\n{}", "Checking system permissions...".bright_black());
     
     // Check Screen Recording permission
-    println!("{}", "Checking Screen Recording Permission...".yellow());
+    println!("{}", "Checking Screen Recording Permission...".bright_black());
     
     // Use proper screen recording permission check function
     if check_screen_recording_access() {
-        println!("{}", "✓ Screen Recording permission is already granted.".green());
+        println!("{}", "✓ Screen Recording permission is already granted.".green().bold());
     } else {
         println!("{}", "✗ Screen Recording permission is denied.".red());
         println!("{}", "Please enable it manually in:".yellow());
@@ -597,7 +632,7 @@ pub fn main() -> Result<()> {
         // Request permission to trigger the system dialog
         let granted = request_screen_recording_access();
         if granted {
-            println!("{}", "✓ Screen Recording permission just granted! Thank you!".green());
+            println!("{}", "✓ Screen Recording permission just granted! Thank you!".green().bold());
         } else {
             println!("{}", "Permission not granted. You may need to go to:".red());
             println!("{}", "System Settings → Privacy & Security → Screen Recording".yellow());
@@ -608,12 +643,12 @@ pub fn main() -> Result<()> {
     }
 
     // Check Input Monitoring permission
-    println!("\n{}", "Checking Input Monitoring Permission...".yellow());
+    println!("\n{}", "Checking Input Monitoring Permission...".bright_black());
     
     // Use the proper input monitoring permission check
     match check_input_monitoring_access() {
         Some(true) => {
-            println!("{}", "✓ Input Monitoring permission is already granted.".green());
+            println!("{}", "✓ Input Monitoring permission is already granted.".green().bold());
         }
         Some(false) => {
             println!("{}", "✗ Input Monitoring permission is denied.".red());
@@ -650,7 +685,7 @@ pub fn main() -> Result<()> {
             
             let granted = request_input_monitoring_access();
             if granted {
-                println!("{}", "✓ Permission just granted! Thank you!".green());
+                println!("{}", "✓ Permission just granted! Thank you!".green().bold());
             } else {
                 println!("{}", "✗ Permission not granted.".red());
                 println!("{}", "You may need to go to:".yellow());
@@ -661,7 +696,7 @@ pub fn main() -> Result<()> {
         }
     }
 
-    println!("\n{}", "All permissions granted! Starting recorder...".green());
+    println!("\n{}", "All permissions granted! Starting recorder...".green().bold());
 
     // Add a note about permissions being granted to Terminal
     println!("{}", "Note: Permissions are granted to Terminal, not Loggy3 itself. Running elsewhere requires re-granting permissions.".bright_black());
@@ -707,14 +742,27 @@ pub fn main() -> Result<()> {
                         println!("Display configuration changed. Starting new session.");
                         break;
                     }
+                    
+                    // Check if we need to rotate to a new chunk based on epoch time
+                    let current_timestamp = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    
+                    // Calculate what the current chunk should be
+                    let current_epoch_chunk = (current_timestamp / 60000) as usize;
+                    
+                    // If our chunk index is behind the epoch time chunk, rotate to catch up
+                    if current_epoch_chunk > session.current_chunk_index {
+                        if let Err(e) = session.rotate_to_new_chunk() {
+                            eprintln!("Error rotating to new chunk: {}", e);
+                        }
+                    }
 
                     thread::sleep(Duration::from_secs(1));
                 }
 
-                // Only cleanup short sessions when we're restarting due to errors or display changes
-                // not when user explicitly stops with Ctrl-C
-                let cleanup_short_sessions = !should_run.load(Ordering::SeqCst);
-                session.stop(cleanup_short_sessions);
+                session.stop();
             }
             None => {
                 if displays_changed {
@@ -779,53 +827,22 @@ fn capture_display_thread(
         Err(_) => return,
     };
 
-
-    let display_dir = session_dir.join(format!("display_{}_{}", display_info.id, display_info.title));
+    // Initialize chunk index based on current epoch time
+    let start_time_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut current_chunk_index = (start_time_ms / 60000) as usize;
+    
+    // Create first chunk directory for this display
+    let current_chunk_dir = session_dir.join(format!("chunk_{:05}", current_chunk_index));
+    let display_dir = current_chunk_dir.join(format!("display_{}_{}", display_info.id, display_info.title));
     if let Err(e) = create_dir_all(&display_dir) {
         eprintln!("Failed to create display directory: {}", e);
         return;
     }
 
-    let (mut ffmpeg_child, mut ffmpeg_stdin) = match initialize_ffmpeg(
-        &display_dir,
-        width.try_into().unwrap(),
-        height.try_into().unwrap(),
-    ) {
-        Ok(child_and_stdin) => child_and_stdin,
-        Err(e) => {
-            eprintln!("Failed to launch ffmpeg: {}", e);
-            return;
-        }
-    };
-
-    if let Some(stdout) = ffmpeg_child.stdout.take() {
-        let display_id = display_info.id;
-        thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    if VERBOSE.load(Ordering::SeqCst) {
-                        println!("FFmpeg stdout (display {}): {}", display_id, line);
-                    }
-                }
-            }
-        });
-    }
-
-    if let Some(stderr) = ffmpeg_child.stderr.take() {
-        let display_id = display_info.id;
-        thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    if VERBOSE.load(Ordering::SeqCst) || line.contains("error") {
-                        eprintln!("FFmpeg (display {}): {}", display_id, line);
-                    }
-                }
-            }
-        });
-    }
-    
+    // Set up frames log in the current chunk's display directory
     let frames_log_path = display_dir.join("frames.log");
     let frames_log_file = match File::create(&frames_log_path) {
         Ok(f) => f,
@@ -837,8 +854,20 @@ fn capture_display_thread(
     let mut frames_log = BufWriter::new(frames_log_file);
     
     let start_time = Instant::now();
-    let mut frame_count = 0;
+    let mut total_frame_count = 0;
+    let mut chunk_frame_count = 0;
     let mut last_status = Instant::now();
+    
+    // Start first ffmpeg process
+    let mut ffmpeg_process = start_new_ffmpeg_process(&display_dir, width.try_into().unwrap(), height.try_into().unwrap(), display_info.id);
+    if ffmpeg_process.is_none() {
+        eprintln!("Failed to start initial ffmpeg process for display {}", display_info.id);
+        return;
+    }
+    
+    // Print initial status message
+    let status_indicator = format!("[Display {}]", display_info.title);
+    println!("{} Started recording", status_indicator.cyan());
     
     while should_run.load(Ordering::SeqCst) {
         let (tx, rx) = mpsc::channel();
@@ -853,25 +882,108 @@ fn capture_display_thread(
 
         match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(Frame::YUVFrame(frame))) => {
-                frame_count += 1;
+                total_frame_count += 1;
+                chunk_frame_count += 1;
+                
+                // Get current timestamp
+                let current_timestamp = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                
+                // Calculate chunk index based on epoch time
+                let new_chunk_index = (current_timestamp / 60000) as usize;
+                
+                // Check if we need to rotate to a new chunk
+                if new_chunk_index > current_chunk_index {
+                    println!("{} {}", 
+                        status_indicator.cyan(),
+                        format!("Finalizing chunk {} based on epoch time ({} frames)", 
+                            current_chunk_index,
+                            chunk_frame_count).yellow()
+                    );
+                    
+                    // Close current ffmpeg process and start a new one
+                    if let Some((mut child, stdin)) = ffmpeg_process.take() {
+                        // Drop stdin first to close the pipe
+                        drop(stdin);
+                        
+                        // Then wait for the child process to finish
+                        if let Err(e) = child.wait() {
+                            eprintln!("Error waiting for ffmpeg to complete: {}", e);
+                        }
+                    }
+                    
+                    // Update to the new chunk index
+                    current_chunk_index = new_chunk_index;
+                    chunk_frame_count = 0;
+                    
+                    // Create directory for the new chunk
+                    let current_chunk_dir = session_dir.join(format!("chunk_{:05}", current_chunk_index));
+                    let display_dir = current_chunk_dir.join(format!("display_{}_{}", display_info.id, display_info.title));
+                    if let Err(e) = create_dir_all(&display_dir) {
+                        eprintln!("Failed to create display directory for new chunk: {}", e);
+                        handle_capture_error(&error_tx);
+                        break;
+                    }
+
+                    // Create new frames log for the new chunk
+                    let frames_log_path = display_dir.join("frames.log");
+                    match File::create(&frames_log_path) {
+                        Ok(file) => {
+                            frames_log = BufWriter::new(file);
+                        },
+                        Err(e) => {
+                            eprintln!("Failed to create frames log for new chunk: {}", e);
+                            handle_capture_error(&error_tx);
+                            break;
+                        }
+                    }
+                    
+                    ffmpeg_process = start_new_ffmpeg_process(&display_dir, width.try_into().unwrap(), height.try_into().unwrap(), display_info.id);
+                    if ffmpeg_process.is_none() {
+                        eprintln!("Failed to start new ffmpeg process for display {}", display_info.id);
+                        handle_capture_error(&error_tx);
+                        break;
+                    }
+                    
+                    println!("{} {}", 
+                        status_indicator.cyan(),
+                        format!("Started new chunk {}", current_chunk_index).green()
+                    );
+                }
             
                 if last_status.elapsed() >= Duration::from_secs(5) {
-                    let fps = frame_count as f64 / start_time.elapsed().as_secs_f64();
+                    let fps = total_frame_count as f64 / start_time.elapsed().as_secs_f64();
+                    
+                    // Calculate seconds remaining in current chunk based on epoch time
+                    let seconds_in_current_chunk = (current_timestamp % 60000) / 1000;
+                    let seconds_remaining = 60 - seconds_in_current_chunk as u64;
 
-                    // Overwrite the same line: "\r\x1b[2K" resets and clears the current line
-                    print!("\r\x1b[2KDisplay {}: Recording at {} fps", 
-                        display_info.title.cyan(),
-                        format!("{:.1}", fps).bright_green()
+                    // Use a simple mutex for synchronizing terminal output across threads
+                    static STATUS_MUTEX: Mutex<()> = Mutex::new(());
+                    let _status_lock = STATUS_MUTEX.lock().unwrap();
+                    
+                    // Print an inline status update
+                    println!("{} Recording at {} fps (chunk {}, frames: {}, seconds remaining: {})", 
+                        status_indicator.cyan(),
+                        format!("{:.1}", fps).bright_green(),
+                        current_chunk_index.to_string().yellow(),
+                        chunk_frame_count.to_string().yellow(),
+                        seconds_remaining.to_string().bright_yellow()
                     );
-
-                    // Flush to ensure the line appears immediately
-                    std::io::stdout().flush().unwrap();
 
                     last_status = Instant::now();
                 }
                 
-                if let Err(e) = write_frame(&mut ffmpeg_stdin, &frame, &mut frames_log) {
-                    eprintln!("Write error for display {}: {}", display_info.id, e);
+                // Write frame to current ffmpeg process
+                if let Some((_, ref mut stdin)) = ffmpeg_process {
+                    if let Err(e) = write_frame(stdin, &frame, &mut frames_log) {
+                        eprintln!("Write error for display {}: {}", display_info.id, e);
+                        break;
+                    }
+                } else {
+                    eprintln!("No active ffmpeg process to write frame for display {}", display_info.id);
                     break;
                 }
             }
@@ -893,9 +1005,99 @@ fn capture_display_thread(
         }
     }
 
-    drop(ffmpeg_stdin);
-    let _ = ffmpeg_child.wait();
-    println!("Stopped capture for display {}", display_info.id);
+    // Clean up the ffmpeg process
+    if let Some((mut child, stdin)) = ffmpeg_process {
+        drop(stdin);
+        let _ = child.wait();
+    }
+    
+    println!("{} Recording stopped", status_indicator.cyan());
+}
+
+// Helper function to start a new ffmpeg process
+fn start_new_ffmpeg_process(
+    display_dir: &std::path::Path,
+    width: usize,
+    height: usize,
+    display_id: u32,
+) -> Option<(Child, ChildStdin)> {
+    // Create a new ffmpeg process with single output
+    let output_path = display_dir.join("video.mp4");
+    let output_str = output_path.to_string_lossy().to_string();
+
+    let ffmpeg_path = get_ffmpeg_path();
+
+    let log_level = if VERBOSE.load(Ordering::SeqCst) {
+        "info"
+    } else {
+        "error"
+    };
+
+    // Start the ffmpeg process
+    let mut child = match Command::new(ffmpeg_path)
+        .args(&[
+            "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "nv12",
+            "-color_range", "tv",
+            "-s", &format!("{}x{}", width, height),
+            "-r", "30",
+            "-i", "pipe:0",
+            "-c:v", FFMPEG_ENCODER,
+            "-movflags", "+frag_keyframe+empty_moov+default_base_moof+faststart",
+            "-frag_duration", "1000000",  // Fragment every 1 second
+            "-g", "60",
+            "-loglevel", log_level,
+            &output_str,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to start ffmpeg: {}", e);
+                return None;
+            }
+        };
+
+    // Get stdin handle
+    let stdin = match child.stdin.take() {
+        Some(s) => s,
+        None => {
+            eprintln!("Failed to get ffmpeg stdin");
+            return None;
+        }
+    };
+
+    // Set up logging
+    if let Some(stdout) = child.stdout.take() {
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    if VERBOSE.load(Ordering::SeqCst) {
+                        println!("FFmpeg stdout (display {}): {}", display_id, line);
+                    }
+                }
+            }
+        });
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    if VERBOSE.load(Ordering::SeqCst) || line.contains("error") {
+                        eprintln!("FFmpeg (display {}): {}", display_id, line);
+                    }
+                }
+            }
+        });
+    }
+
+    Some((child, stdin))
 }
 
 fn handle_capture_error(error_tx: &Sender<()>) {
@@ -1170,49 +1372,6 @@ fn get_ffmpeg_path() -> PathBuf {
     }
 
     PathBuf::from("ffmpeg")
-}
-
-fn initialize_ffmpeg(
-    display_dir: &std::path::Path,
-    width: usize,
-    height: usize,
-) -> Result<(Child, ChildStdin)> {
-    let output_path = display_dir.join("chunk_%05d.mp4");
-    let output_str = output_path.to_string_lossy().to_string();
-
-    let ffmpeg_path = get_ffmpeg_path();
-
-    let log_level = if VERBOSE.load(Ordering::SeqCst) {
-        "info"
-    } else {
-        "error"
-    };
-
-    let mut child = Command::new(ffmpeg_path)
-        .args(&[
-            "-y",
-            "-f", "rawvideo",
-            "-pix_fmt", "nv12",
-            "-color_range", "tv",
-            "-s", &format!("{}x{}", width, height),
-            "-r", "30",
-            "-i", "pipe:0",
-            "-c:v", FFMPEG_ENCODER,
-            "-movflags", "+faststart",
-            "-g", "60",
-            "-f", "segment",
-            "-segment_time", "60",
-            "-reset_timestamps", "1",
-            "-loglevel", log_level,
-            &output_str,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let stdin = child.stdin.take().unwrap();
-    Ok((child, stdin))
 }
 
 fn write_frame(
