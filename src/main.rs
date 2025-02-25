@@ -675,7 +675,7 @@ fn start_new_ffmpeg_process(
         .args(&[
             "-y",
             "-f", "rawvideo",
-            "-pix_fmt", "nv12",
+            "-pix_fmt", platform::FFMPEG_PIXEL_FORMAT,
             "-color_range", "tv",
             "-s", &format!("{}x{}", width, height),
             "-r", "30",
@@ -792,10 +792,13 @@ fn download_ffmpeg() -> Result<PathBuf> {
         std::fs::rename(&temp_path, &ffmpeg_path)?;
         println!("Download complete");
         
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&ffmpeg_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&ffmpeg_path, perms)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&ffmpeg_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&ffmpeg_path, perms)?;
+        }
     }
     
     Ok(ffmpeg_path)
