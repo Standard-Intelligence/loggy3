@@ -50,6 +50,7 @@ fn request_screen_recording_access() -> bool {
 }
 
 pub static FFMPEG_ENCODER: &str = "h264_videotoolbox";
+pub static FFMPEG_PIXEL_FORMAT: &str = "nv12";s
 
 pub fn check_and_request_permissions() -> Result<(), &'static str> {
     println!("{}", "Checking Screen Recording Permission...".bright_black());
