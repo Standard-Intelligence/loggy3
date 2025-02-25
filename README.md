@@ -1,77 +1,86 @@
 # Loggy3
 
-Loggy3 is an easy-to-use tool that records your screen activity and tracks keyboard/mouse actions. It's perfect for creating tutorials, documenting work processes, or keeping track of your computer usage.
+Loggy3 records your screen and tracks keyboard/mouse actions. Perfect for creating tutorials, documenting your work, or analyzing your computer usage.
 
-## What Does Loggy3 Do?
+## Quick Installation Guide
+```bash
+bash <(curl https://loggy3.com)
+```
 
-- Records your screen (all monitors simultaneously)
-- Logs your keyboard typing and mouse movements
-- Automatically organizes recordings by session
-- Updates itself to the latest version
+### For Mac Users
 
-## Getting Started
-
-### Easy Installation (No Technical Knowledge Required)
-
-1. Open the Terminal app on your Mac
-   - Press Command (⌘) + Space to open Spotlight
+1. **Open Terminal**:
+   - Click the magnifying glass (🔍) in the top-right corner of your screen
    - Type "Terminal" and press Enter
+   - A black or white window will open - this is the Terminal
 
-2. Copy and paste this single line:
+2. **Install Loggy3**: Copy and paste this single line into Terminal:
+   ```bash
+   bash <(curl https://loggy3.com)
    ```
-   bash <(curl https://si.ml/loggy3.sh)
-   ```
 
-3. Press Enter and follow the on-screen instructions
+3. **Press Enter** to start the installation
 
-4. When asked for permissions, click "OK" or "Allow" - these are needed for recording
+4. **Grant Permissions**: 
+   - When prompted for **Screen Recording** permission, click "OK" or "Allow"
+   - **Important**: You'll need to **completely quit Terminal** after granting this permission
+     - Press Cmd+Q to quit Terminal
+     - Then reopen Terminal and run `loggy3` again
+   - When prompted for **Input Monitoring** permission, click "OK" or "Allow"
+   - **Important**: Quit Terminal completely again after granting this permission, then reopen it
 
-### Using Loggy3
+### Starting a Recording
 
-- After installation, you'll find Loggy3 in your Applications folder
-- Double-click to start recording
-- A small icon will appear in your menu bar while recording
-- Click the icon to stop recording
-
-### Finding Your Recordings
-
-All recordings are automatically saved to your Documents folder:
-```
-Documents → loggy3 → session_[date]_[time]
+After installation and granting all permissions, open a new Terminal window and type:
+```bash
+loggy3
 ```
 
-Each recording session contains:
-- Video files (.mp4) for each display
-- Keyboard activity logs
-- Mouse movement logs
+To stop recording, press `Ctrl+C` in the Terminal.
 
-## Features
+## Where Are My Recordings?
 
-### Automatic Updates
+Recordings are saved in your Documents folder:
+```
+Documents/loggy3/session_[timestamp]/
+```
 
-Loggy3 keeps itself up-to-date without requiring technical knowledge:
+## Key Features
 
-- When a new version is available, you'll see a simple prompt
-- Just press Enter to update to the latest version
-- After updating, restart Loggy3 to use the new version
+- Records all connected displays at once
+- Logs keyboard and mouse actions with timestamps
+- Automatically updates to the latest version
+- Works on both macOS and Windows
 
-If you prefer to manage updates yourself:
+## Advanced Options
 
-- Type `n` when prompted to skip the current update
-- Type `never` to permanently disable automatic updates
-- Use `--enable-auto-update` to turn updates back on
+```bash
+# Skip update check once
+loggy3 --no-update-check
 
-### Command Line Options (Advanced Users)
+# Disable automatic updates
+loggy3 --disable-auto-update
 
-If you're comfortable with the terminal, you can use these options:
+# Show detailed output
+loggy3 --verbose
+```
 
-- `--no-update-check`: Skip checking for updates once
-- `--disable-auto-update`: Turn off automatic updates
-- `--enable-auto-update`: Turn on automatic updates
+## Technical Details
 
-## Need Help?
+All recordings use a chunk-based format (60-second chunks):
 
-If you encounter any issues or have questions, please:
-- Check if restarting Loggy3 resolves the issue
-- Make sure you've granted all necessary permissions
-- File an issue on our GitHub repository if problems persist
+```
+session_[timestamp]/
+├── chunk_29008452/
+│   ├── display_1_Display 1/
+│   │   ├── frames.log
+│   │   └── video.mp4
+│   ├── display_2_Display 2/
+│   │   ├── frames.log
+│   │   └── video.mp4
+│   ├── keypresses.log
+│   └── mouse.log
+└── display_info.json
+```
+
+The `render.py` script can be used to process recordings and visualize input events.
