@@ -27,6 +27,63 @@ use core_graphics::event::{CGEventTap, CGEventTapLocation, CGEventTapPlacement,
 use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
 use rdev::{listen, Event, EventType};
 
+// Permission checking code for macOS
+// IOKit bindings for Input Monitoring permissions
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOHIDCheckAccess(request: u32) -> u32;
+    fn IOHIDRequestAccess(request: u32) -> bool;
+}
+
+// CoreGraphics bindings for Screen Recording permissions
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
+}
+
+// Input Monitoring constants
+// According to IOKit/IOHIDLib.h, for 10.15+:
+//  kIOHIDRequestTypePostEvent   = 0, // Accessibility
+//  kIOHIDRequestTypeListenEvent = 1, // Input Monitoring
+const KIOHID_REQUEST_TYPE_LISTEN_EVENT: u32 = 1;
+
+// Functions for checking and requesting permissions
+
+/// Checks the current input monitoring status:
+///  - Some(true) = Granted
+///  - Some(false) = Denied
+///  - None = Not determined yet
+fn check_input_monitoring_access() -> Option<bool> {
+    unsafe {
+        let status = IOHIDCheckAccess(KIOHID_REQUEST_TYPE_LISTEN_EVENT);
+        match status {
+            0 => Some(true),  // Granted
+            1 => Some(false), // Denied
+            2 => None,        // Not determined yet
+            _ => None,        // Any unexpected value -> treat like "unknown"
+        }
+    }
+}
+
+/// Requests input monitoring access (prompts user if not determined).
+/// Returns `true` if permission is (now) granted, `false` otherwise.
+fn request_input_monitoring_access() -> bool {
+    unsafe { IOHIDRequestAccess(KIOHID_REQUEST_TYPE_LISTEN_EVENT) }
+}
+
+/// Checks if screen recording permission is granted
+/// Returns true if granted, false if denied or not determined
+fn check_screen_recording_access() -> bool {
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+/// Requests screen recording access (prompts user if not determined)
+/// Returns true if permission is granted, false otherwise
+fn request_screen_recording_access() -> bool {
+    unsafe { CGRequestScreenCaptureAccess() }
+}
+
 use serde::{Deserialize, Serialize};
 use colored::*;
 
@@ -381,164 +438,81 @@ pub fn main() -> Result<()> {
     // Check permissions at startup
     println!("\n{}", "Checking system permissions...".yellow());
     
-    // Check Screen Recording permission by actually trying to capture a frame
+    // Check Screen Recording permission
     print!("Screen Recording Permission: ");
     
-    // Set up a panic handler to catch unwrap errors in the screencapturekit library
-    let screen_perm_result = std::panic::catch_unwind(|| {
-        // First check if we can get display info
-        let display_result = CGDisplay::active_displays();
-        if let Ok(display_ids) = &display_result {
-            if display_ids.is_empty() {
-                return false;
-            }
-            
-            // This might panic if permission is denied, but we'll catch it
-            if let Ok(targets) = std::panic::catch_unwind(|| {
-                scap::get_all_targets()
-            }) {
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    });
-    
-    let has_screen_permission = match screen_perm_result {
-        Ok(true) => true,
-        _ => false
-    };
-    
-    if has_screen_permission {
+    // Use proper screen recording permission check function
+    if check_screen_recording_access() {
         println!("{}", "✓ Enabled".green());
     } else {
-        println!("{}", "✗ Disabled (cannot capture screen)".red());
+        println!("{}", "✗ Disabled".red());
         println!("{}", "Please enable Screen Recording permission in System Settings > Privacy & Security > Screen Recording".red());
-        println!("{}", "Note: You may need to quit and restart Terminal after granting permission".yellow());
-        return Ok(());
+        
+        // Request permission to trigger the system dialog
+        let granted = request_screen_recording_access();
+        if granted {
+            println!("{}", "✓ Screen Recording permission just granted! Thank you!".green());
+        } else {
+            println!("{}", "Permission not granted. You may need to go to:".red());
+            println!("{}", "System Settings → Privacy & Security → Screen Recording".yellow());
+            println!("{}", "...and enable it for this application.".yellow());
+            println!("{}", "Note: You may need to quit and restart Terminal after granting permission".yellow());
+            return Ok(());
+        }
     }
 
-    // Interactive test for Input Monitoring permission
-    println!("\n{}", "Testing Input Monitoring Permission...".yellow());
+    // Check Input Monitoring permission
+    println!("\n{}", "Checking Input Monitoring Permission...".yellow());
     
-    // First check if permission might already be denied (due to previous runs)
-    println!("{}", "If you've previously denied Input Monitoring permission, you'll need to manually enable it.".bright_white());
-    println!("{}", "The permission dialog will only appear the first time you run the app.".yellow());
-    
-    // Try to trigger the permission prompt by creating event monitors
-    // This will cause macOS to show the permission prompt if it hasn't been shown before
-    println!("{}", "If prompted, please click \"Allow\" to grant Input Monitoring permission.".bright_green().bold());
-    
-    // Try both mechanisms to trigger the permission dialog
-    let _ = CGEventTap::new(
-        CGEventTapLocation::HID,
-        CGEventTapPlacement::HeadInsertEventTap,
-        CGEventTapOptions::ListenOnly,
-        vec![
-            CGEventType::KeyDown,
-            CGEventType::KeyUp,
-            CGEventType::MouseMoved,
-        ],
-        |_, _, _| None
-    );
-    
-    let listen_thread = thread::spawn(|| {
-        let _ = listen(|_| {});
-    });
-    
-    // Give the system a moment to show permission dialogs if needed
-    thread::sleep(Duration::from_secs(1));
-    
-    // Interactive check with the user
-    println!("\n{}", "Please press the SPACEBAR key when prompted to test if input monitoring is working.".bright_white());
-    println!("{}", "Don't press any keys yet, wait for the prompt...".yellow());
-    
-    // Give the user a moment to read the instructions
-    thread::sleep(Duration::from_secs(2));
-    
-    // Create a channel to receive key press notifications
-    let (tx, rx) = mpsc::channel();
-    
-    // Create a shared atomic flag to signal when we've detected a key
-    let key_detected = Arc::new(AtomicBool::new(false));
-    
-    // Start keyboard monitoring using rdev in a separate thread
-    let rdev_key_detected = key_detected.clone();
-    let rdev_tx = tx.clone();
-    thread::spawn(move || {
-        let _ = listen(move |event| {
-            if let EventType::KeyPress(_) = event.event_type {
-                rdev_key_detected.store(true, Ordering::SeqCst);
-                let _ = rdev_tx.send(());
-            }
-        });
-    });
-    
-    // Prompt the user to press a key
-    println!("\n{}", ">>> Press SPACEBAR now to check permissions <<<".bright_green().bold());
-    
-    // Wait for a key press event or timeout
-    let timeout = Duration::from_secs(5);
-    let start = Instant::now();
-    let mut detected_key_press = false;
-    
-    while start.elapsed() < timeout {
-        if let Ok(_) = rx.try_recv() {
-            detected_key_press = true;
-            break;
+    // Use the proper input monitoring permission check
+    match check_input_monitoring_access() {
+        Some(true) => {
+            println!("{}", "✓ Input Monitoring permission is already granted.".green());
         }
-        
-        if key_detected.load(Ordering::SeqCst) {
-            detected_key_press = true;
-            break;
-        }
-        
-        thread::sleep(Duration::from_millis(100));
-    }
-    
-    if detected_key_press {
-        println!("{}", "\n✓ Input Monitoring Permission: Enabled".green());
-    } else {
-        println!("{}", "\n✗ Input Monitoring Permission: Disabled (no key events detected)".red());
-        println!("{}", "You need to manually enable Input Monitoring permission in System Settings.".bright_red().bold());
-        
-        // Explain why the permission dialog might not appear
-        println!("\n{}", "NOTE: If you previously denied permission, macOS won't show the permission dialog again.".yellow().bold());
-        println!("{}", "You must manually enable the permission in System Settings.".yellow().bold());
-        
-        // Provide detailed instructions for enabling permissions
-        println!("\n{}", "To enable permission:".yellow());
-        println!("{}", "1. Open System Settings".yellow());
-        println!("{}", "2. Go to Privacy & Security > Input Monitoring".yellow());
-        println!("{}", "3. Click the lock icon and authenticate if needed".yellow());
-        println!("{}", "4. Toggle the switch for Terminal.app to ON".yellow());
-        println!("{}", "5. Quit and restart Terminal completely".yellow());
-        
-        // Try to open System Settings directly 
-        let open_settings_result = Command::new("open")
-            .args(["-a", "System Settings"])
-            .spawn();
+        Some(false) => {
+            println!("{}", "✗ Input Monitoring permission is denied.".red());
+            println!("{}", "Please enable it manually in:".yellow());
+            println!("{}", "System Settings → Privacy & Security → Input Monitoring".yellow());
             
-        match open_settings_result {
-            Ok(_) => {
-                println!("\n{}", "System Settings has been opened for you.".bright_white());
-                println!("{}", "Please navigate to: Privacy & Security > Input Monitoring".bright_white());
+            // Try to open System Settings directly 
+            let open_settings_result = Command::new("open")
+                .args(["-a", "System Settings"])
+                .spawn();
+                
+            match open_settings_result {
+                Ok(_) => {
+                    println!("\n{}", "System Settings has been opened for you.".bright_white());
+                    println!("{}", "Please navigate to: Privacy & Security > Input Monitoring".bright_white());
+                }
+                Err(_) => {
+                    println!("\n{}", "Could not automatically open System Settings.".red());
+                    println!("{}", "Please open it manually from the Dock or Applications folder.".yellow());
+                }
             }
-            Err(_) => {
-                println!("\n{}", "Could not automatically open System Settings.".red());
-                println!("{}", "Please open it manually from the Dock or Applications folder.".yellow());
+            
+            // Also try more direct methods for different macOS versions
+            let _ = Command::new("open")
+                .args(["x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"])
+                .spawn();
+                
+            println!("\n{}", "After enabling the permission, please restart this app.".bright_green());
+            return Ok(());
+        }
+        None => {
+            println!("{}", "🟡 Input Monitoring permission is not determined. Requesting now...".yellow());
+            println!("{}", "If prompted, please click \"Allow\" to grant Input Monitoring permission.".bright_green().bold());
+            
+            let granted = request_input_monitoring_access();
+            if granted {
+                println!("{}", "✓ Permission just granted! Thank you!".green());
+            } else {
+                println!("{}", "✗ Permission not granted.".red());
+                println!("{}", "You may need to go to:".yellow());
+                println!("{}", "System Settings → Privacy & Security → Input Monitoring".yellow());
+                println!("{}", "...and enable it for this application.".yellow());
+                return Ok(());
             }
         }
-        
-        // Also try more direct methods for different macOS versions
-        let _ = Command::new("open")
-            .args(["x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"])
-            .spawn();
-            
-        println!("\n{}", "After enabling the permission, please restart this app.".bright_green());
-        return Ok(());
     }
 
     println!("\n{}", "All permissions granted! Starting recorder...".green());
