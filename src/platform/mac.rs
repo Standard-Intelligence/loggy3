@@ -29,33 +29,20 @@ use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
 use rdev::{listen, Event, EventType};
 use ureq;
 
-// Permission checking code for macOS
-// IOKit bindings for Input Monitoring permissions
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
     fn IOHIDCheckAccess(request: u32) -> u32;
     fn IOHIDRequestAccess(request: u32) -> bool;
 }
 
-// CoreGraphics bindings for Screen Recording permissions
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
 }
 
-// Input Monitoring constants
-// According to IOKit/IOHIDLib.h, for 10.15+:
-//  kIOHIDRequestTypePostEvent   = 0, // Accessibility
-//  kIOHIDRequestTypeListenEvent = 1, // Input Monitoring
 const KIOHID_REQUEST_TYPE_LISTEN_EVENT: u32 = 1;
 
-// Functions for checking and requesting permissions
-
-/// Checks the current input monitoring status:
-///  - Some(true) = Granted
-///  - Some(false) = Denied
-///  - None = Not determined yet
 fn check_input_monitoring_access() -> Option<bool> {
     unsafe {
         let status = IOHIDCheckAccess(KIOHID_REQUEST_TYPE_LISTEN_EVENT);
@@ -68,20 +55,14 @@ fn check_input_monitoring_access() -> Option<bool> {
     }
 }
 
-/// Requests input monitoring access (prompts user if not determined).
-/// Returns `true` if permission is (now) granted, `false` otherwise.
 fn request_input_monitoring_access() -> bool {
     unsafe { IOHIDRequestAccess(KIOHID_REQUEST_TYPE_LISTEN_EVENT) }
 }
 
-/// Checks if screen recording permission is granted
-/// Returns true if granted, false if denied or not determined
 fn check_screen_recording_access() -> bool {
     unsafe { CGPreflightScreenCaptureAccess() }
 }
 
-/// Requests screen recording access (prompts user if not determined)
-/// Returns true if permission is granted, false otherwise
 fn request_screen_recording_access() -> bool {
     unsafe { CGRequestScreenCaptureAccess() }
 }
@@ -125,7 +106,6 @@ pub struct DisplayInfo {
     pub capture_height: u32,
 }
 
-// Writer cache to manage log files across chunk boundaries
 pub struct LogWriterCache {
     session_dir: PathBuf,
     keypress_writers: HashMap<usize, Arc<Mutex<BufWriter<File>>>>,
@@ -141,15 +121,12 @@ impl LogWriterCache {
         }
     }
 
-    // Get or create a writer for keypresses based on timestamp
     fn get_keypress_writer(&mut self, timestamp_ms: u128) -> Result<Arc<Mutex<BufWriter<File>>>> {
         let chunk_index = (timestamp_ms / 60000) as usize;
         if !self.keypress_writers.contains_key(&chunk_index) {
-            // Create the chunk directory if needed
             let chunk_dir = self.session_dir.join(format!("chunk_{:05}", chunk_index));
             create_dir_all(&chunk_dir)?;
             
-            // Create the log file
             let log_path = chunk_dir.join("keypresses.log");
             let writer = Arc::new(Mutex::new(BufWriter::new(File::create(log_path)?)));
             println!("{}", format!("Created new keypress log for chunk {}", chunk_index).yellow());
@@ -158,11 +135,9 @@ impl LogWriterCache {
         Ok(self.keypress_writers.get(&chunk_index).unwrap().clone())
     }
     
-    // Get or create a writer for mouse events based on timestamp
     fn get_mouse_writer(&mut self, timestamp_ms: u128) -> Result<Arc<Mutex<BufWriter<File>>>> {
         let chunk_index = (timestamp_ms / 60000) as usize;
         if !self.mouse_writers.contains_key(&chunk_index) {
-            // Create the chunk directory if needed
             let chunk_dir = self.session_dir.join(format!("chunk_{:05}", chunk_index));
             create_dir_all(&chunk_dir)?;
             
@@ -176,11 +151,9 @@ impl LogWriterCache {
     }
 }
 
-// New function to log mouse events with automatic chunk management
 fn log_mouse_event_with_cache(timestamp: u128, cache: &Arc<Mutex<LogWriterCache>>, data: &str) {
     let line = format!("({}, {})\n", timestamp, data);
     
-    // Get the appropriate writer for this timestamp
     if let Ok(mut cache_lock) = cache.lock() {
         if let Ok(writer) = cache_lock.get_mouse_writer(timestamp) {
             if let Ok(mut writer_lock) = writer.lock() {
@@ -191,7 +164,6 @@ fn log_mouse_event_with_cache(timestamp: u128, cache: &Arc<Mutex<LogWriterCache>
     }
 }
 
-// New function to handle key events with automatic chunk management
 fn handle_key_event_with_cache(
     is_press: bool,
     key: rdev::Key,
@@ -218,7 +190,6 @@ fn handle_key_event_with_cache(
 
     let line = format!("({}, '{}')\n", timestamp, state);
     
-    // Get the appropriate writer for this timestamp
     if let Ok(mut cache_lock) = cache.lock() {
         if let Ok(writer) = cache_lock.get_keypress_writer(timestamp) {
             if let Ok(mut writer_lock) = writer.lock() {
@@ -229,7 +200,6 @@ fn handle_key_event_with_cache(
     }
 }
 
-// New unified event listener that uses the writer cache
 pub fn unified_event_listener_thread_with_cache(
     should_run: Arc<AtomicBool>,
     writer_cache: Arc<Mutex<LogWriterCache>>,
@@ -369,7 +339,6 @@ struct Session {
 
     capture_threads: Vec<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
 
-    // Replace individual log files with a writer cache
     writer_cache: Arc<Mutex<LogWriterCache>>,
     pressed_keys: Arc<Mutex<Vec<String>>>,
 
@@ -378,10 +347,6 @@ struct Session {
     
     displays: Vec<DisplayInfo>,
     progress_threads: Vec<thread::JoinHandle<()>>,
-    
-    // We still keep track of the current chunk index for display/info purposes
-    current_chunk_index: usize,
-    last_chunk_timestamp: u128,
 }
 
 impl Session {
@@ -411,17 +376,7 @@ impl Session {
         let json_path = session_dir.join("display_info.json");
         let mut f = File::create(&json_path)?;
         serde_json::to_writer_pretty(&mut f, &displays)?;
-
-        // Initialize chunk index based on current epoch time
-        let current_timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
         
-        // Calculate chunk number based on epoch time, in 60-second increments
-        let current_chunk_index = (current_timestamp / 60000) as usize;
-        
-        // Create the writer cache instead of individual log files
         let writer_cache = Arc::new(Mutex::new(LogWriterCache::new(session_dir.clone())));
         let pressed_keys = Arc::new(Mutex::new(vec![]));
 
@@ -438,8 +393,6 @@ impl Session {
             error_tx,
             displays,
             progress_threads: Vec::new(),
-            current_chunk_index: current_chunk_index,
-            last_chunk_timestamp: current_timestamp,
         }))
     }
     
@@ -461,7 +414,6 @@ impl Session {
     }
 
     fn stop(self) {
-        // No need for the cleanup_short_sessions parameter
         let session_dir = self.session_dir.clone();
         
         for (flag, handle) in self.capture_threads {
@@ -482,8 +434,6 @@ impl Session {
             }
         }
 
-        // Stop progress indicator threads
-        // We need to take ownership of each handle to join it
         for handle in self.progress_threads {
             let _ = handle.join();
         }
@@ -510,41 +460,16 @@ impl Session {
         });
         self.capture_threads.push((sr_for_thread, handle));
     }
-
-    // Update the rotate_to_new_chunk method to just update tracking variables
-    // This no longer needs to create new files - the writer cache does that automatically
-    fn rotate_to_new_chunk(&mut self) -> Result<()> {
-        // Get current timestamp and calculate chunk index directly from epoch time
-        let current_timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        
-        // Calculate chunk index based on epoch time in 60-second increments
-        self.current_chunk_index = (current_timestamp / 60000) as usize;
-        
-        // Update timestamp for the new chunk
-        self.last_chunk_timestamp = current_timestamp;
-            
-        println!("{}", format!("Current chunk index is now {}", self.current_chunk_index).green());
-        
-        Ok(())
-    }
 }
 
 pub fn main() -> Result<()> {
-    // Check for command-line flags
     let args: Vec<String> = std::env::args().collect();
     let verbose_mode = args.iter().any(|arg| arg == "--verbose" || arg == "-v");
-    let no_update_check = args.iter().any(|arg| arg == "--no-update-check");
-    let disable_auto_update = args.iter().any(|arg| arg == "--disable-auto-update");
-    let enable_auto_update = args.iter().any(|arg| arg == "--enable-auto-update");
     
     if verbose_mode {
         VERBOSE.store(true, Ordering::SeqCst);
     }
     
-    // Load auto-update preferences
     match load_update_preferences() {
         Ok(disabled) => {
             AUTO_UPDATES_DISABLED.store(disabled, Ordering::SeqCst);
@@ -557,15 +482,6 @@ pub fn main() -> Result<()> {
             let _ = save_update_preferences(false);
         }
     }
-    
-    // Override with command-line flags if provided
-    if disable_auto_update {
-        AUTO_UPDATES_DISABLED.store(true, Ordering::SeqCst);
-        let _ = save_update_preferences(true);
-    } else if enable_auto_update {
-        AUTO_UPDATES_DISABLED.store(false, Ordering::SeqCst);
-        let _ = save_update_preferences(false);
-    }
 
     println!("{} {}", "\nLoggy3 Screen Recorder".bright_green().bold(), 
               format!("v{}", CURRENT_VERSION).bright_cyan());
@@ -575,8 +491,8 @@ pub fn main() -> Result<()> {
         println!("{}", "Verbose output enabled".yellow());
     }
     
-    // Check for updates unless explicitly disabled
-    if !no_update_check && !AUTO_UPDATES_DISABLED.load(Ordering::SeqCst) {
+    // Check for updates
+    if !AUTO_UPDATES_DISABLED.load(Ordering::SeqCst) {
         println!("{}", "Checking for updates...".cyan());
         
         if let Some((version, download_url, release_url)) = check_for_updates() {
@@ -590,7 +506,7 @@ pub fn main() -> Result<()> {
             println!("Release page: {}", release_url.bright_blue().underline());
             
             // Prompt user for action
-            println!("\nWould you like to update now? [Y/n/never] ");
+            println!("\nWould you like to update now? [Y/n] ");
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             
@@ -598,12 +514,6 @@ pub fn main() -> Result<()> {
                 "y" | "yes" | "" => {
                     // User wants to update
                     update_to_new_version(&download_url)?;
-                }
-                "never" => {
-                    // User wants to disable auto-updates
-                    println!("{}", "Auto-updates disabled. You can re-enable them with --enable-auto-update".yellow());
-                    AUTO_UPDATES_DISABLED.store(true, Ordering::SeqCst);
-                    save_update_preferences(true)?;
                 }
                 _ => {
                     // User doesn't want to update now
@@ -741,22 +651,6 @@ pub fn main() -> Result<()> {
                     if current != current_fingerprint {
                         println!("Display configuration changed. Starting new session.");
                         break;
-                    }
-                    
-                    // Check if we need to rotate to a new chunk based on epoch time
-                    let current_timestamp = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis();
-                    
-                    // Calculate what the current chunk should be
-                    let current_epoch_chunk = (current_timestamp / 60000) as usize;
-                    
-                    // If our chunk index is behind the epoch time chunk, rotate to catch up
-                    if current_epoch_chunk > session.current_chunk_index {
-                        if let Err(e) = session.rotate_to_new_chunk() {
-                            eprintln!("Error rotating to new chunk: {}", e);
-                        }
                     }
 
                     thread::sleep(Duration::from_secs(1));

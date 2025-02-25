@@ -55,12 +55,6 @@ Documents/loggy3/session_[timestamp]/
 ## Advanced Options
 
 ```bash
-# Skip update check once
-loggy3 --no-update-check
-
-# Disable automatic updates
-loggy3 --disable-auto-update
-
 # Show detailed output
 loggy3 --verbose
 ```
