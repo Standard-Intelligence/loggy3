@@ -331,7 +331,7 @@ fn get_display_fingerprint() -> String {
         Err(_) => {
             let mut display_strings: Vec<String> = displays
                 .iter()
-                .map(|d| format!("{}:{}x{}", d.id, d.x, d.y))
+                .map(|d| format!("{}:{}x{}, {}x{}", d.id, d.x, d.y, d.original_width, d.original_height))
                 .collect();
             display_strings.sort();
             display_strings.join(",")
