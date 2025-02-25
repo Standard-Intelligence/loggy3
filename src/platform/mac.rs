@@ -2,6 +2,7 @@ use core_graphics::display::CGDisplay;
 use core_graphics::event::{CGEventTap, CGEventTapLocation, CGEventTapPlacement,
     CGEventTapOptions, CGEventType, EventField};
 use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
+use scap::Target;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -260,4 +261,21 @@ pub fn get_display_info() -> Vec<DisplayInfo> {
         Err(e) => eprintln!("Error retrieving active displays: {:?}", e),
     }
     results
+}
+
+
+pub fn get_target_matching_display_info(targets: Vec<Target>, display_info: DisplayInfo) -> Option<Target> {
+    let target = match targets.iter()
+        .find(|t| match t {
+            Target::Display(d) => d.id == display_info.id,
+            _ => false
+        })
+        .cloned() {
+            Some(t) => t,
+            None => {
+                eprintln!("Could not find matching display target for ID: {}", display_info.id);
+                return None;
+            }
+        };
+    Some(target)
 }

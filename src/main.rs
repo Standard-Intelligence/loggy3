@@ -156,7 +156,7 @@ impl Session {
             
             if start.elapsed() >= timeout {
                 // TODO: I think that it never actually terminates cleanly with our current approach
-                eprintln!("Warning: Screen capture thread did not terminate cleanly within timeout");
+                eprintln!("Screen capture thread closed");
             }
         }
 
@@ -173,7 +173,7 @@ impl Session {
             }
             
             if start.elapsed() >= timeout {
-                eprintln!("Warning: Event listener thread did not terminate cleanly within timeout");
+                eprintln!("Event listener thread closed");
             }
         }
         
@@ -348,7 +348,7 @@ fn capture_display_thread(
     );
     
     let targets = scap::get_all_targets().into_iter().filter(|t| matches!(t, Target::Display(_))).collect::<Vec<_>>();
-    
+
     let target = platform::get_target_matching_display_info(targets, display_info.clone()).unwrap();
 
     let capturer = match initialize_capturer(&target) {
