@@ -21,6 +21,7 @@ use scap::{
     frame::{Frame, FrameType, YUVFrame},
     Target,
 };
+use sysinfo::System;
 
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{CGEventTap, CGEventTapLocation, CGEventTapPlacement,
@@ -373,6 +374,11 @@ impl Session {
         }
         println!("{}\n", "=====================================".cyan());
 
+        // Log session metadata (version and system info)
+        if let Err(e) = log_session_metadata(&session_dir) {
+            eprintln!("Warning: Failed to log session metadata: {}", e);
+        }
+
         let json_path = session_dir.join("display_info.json");
         let mut f = File::create(&json_path)?;
         serde_json::to_writer_pretty(&mut f, &displays)?;
@@ -416,11 +422,34 @@ impl Session {
     fn stop(self) {
         let session_dir = self.session_dir.clone();
         
+        // Log that we're stopping the session
+        println!("{}", "Stopping recording session...".yellow());
+        
+        // Stop all capture threads first, with a timeout mechanism
         for (flag, handle) in self.capture_threads {
+            // Set should_run to false for this thread
             flag.store(false, Ordering::SeqCst);
-            let _ = handle.join();
+            
+            // Wait for thread to finish with timeout
+            let start = Instant::now();
+            let timeout = Duration::from_secs(3);
+            
+            // Try to join the thread with timeout
+            while start.elapsed() < timeout {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            
+            // If thread didn't finish within timeout, just log and continue
+            if start.elapsed() >= timeout {
+                eprintln!("Warning: Screen capture thread did not terminate cleanly within timeout");
+            }
         }
 
+        // Stop event thread with a timeout
         if let Some(event_thread) = self.event_thread {
             let start = Instant::now();
             let timeout = Duration::from_secs(5);
@@ -432,8 +461,13 @@ impl Session {
                 }
                 thread::sleep(Duration::from_millis(100));
             }
+            
+            if start.elapsed() >= timeout {
+                eprintln!("Warning: Event listener thread did not terminate cleanly within timeout");
+            }
         }
 
+        // Clean up any progress threads
         for handle in self.progress_threads {
             let _ = handle.join();
         }
@@ -629,11 +663,17 @@ pub fn main() -> Result<()> {
         
         sr_for_signals.store(false, Ordering::SeqCst);
     });
+    
     let mut last_display_fingerprint = String::new();
 
     while should_run.load(Ordering::SeqCst) {
         let current_fingerprint = get_display_fingerprint();
         let displays_changed = current_fingerprint != last_display_fingerprint;
+        
+        if displays_changed && !last_display_fingerprint.is_empty() {
+            println!("{}", "Display configuration changed!".bright_yellow().bold());
+        }
+        
         last_display_fingerprint = current_fingerprint.clone();
 
         match Session::new(should_run.clone())? {
@@ -643,30 +683,40 @@ pub fn main() -> Result<()> {
                 while should_run.load(Ordering::SeqCst) {
                     let need_restart = session.check_for_errors();
                     if need_restart {
-                        println!("Session signaled a critical error. Restarting session.");
+                        println!("{}", "Session signaled a critical error. Restarting session.".red());
                         break;
                     }
 
                     let current = get_display_fingerprint();
                     if current != current_fingerprint {
-                        println!("Display configuration changed. Starting new session.");
+                        println!("{}", "Display configuration changed. Stopping current session...".yellow());
                         break;
                     }
 
                     thread::sleep(Duration::from_secs(1));
                 }
 
+                // Explicitly stopping the session to ensure clean shutdown
                 session.stop();
+                
+                // If we're exiting due to a global shutdown (Ctrl-C), break the outer loop
+                if !should_run.load(Ordering::SeqCst) {
+                    break;
+                }
+                
+                // For display changes or errors, wait a moment before restarting
+                thread::sleep(Duration::from_secs(1));
             }
             None => {
                 if displays_changed {
-                    println!("All displays disconnected. Waiting for displays to be connected...");
+                    println!("{}", "All displays disconnected. Waiting for displays to be connected...".yellow());
                 }
                 thread::sleep(Duration::from_secs(10));
             }
         }
     }
 
+    println!("{}", "Recording stopped. Thank you for using Loggy3!".green().bold());
     Ok(())
 }
 
@@ -708,6 +758,7 @@ fn capture_display_thread(
             }
         };
 
+    // Initialize capturer
     let capturer = match initialize_capturer(&target) {
         Some(c) => c,
         None => return,
@@ -763,19 +814,29 @@ fn capture_display_thread(
     let status_indicator = format!("[Display {}]", display_info.title);
     println!("{} Started recording", status_indicator.cyan());
     
+    // How often to check for coordination signals
+    let signal_check_interval = Duration::from_millis(100);
+    
     while should_run.load(Ordering::SeqCst) {
-        let (tx, rx) = mpsc::channel();
-        let capturer_clone = capturer.clone();
-
-        thread::spawn(move || {
-            if let Ok(c) = capturer_clone.lock() {
-                let frame = c.get_next_frame();
-                let _ = tx.send(frame);
+        // Try to get a frame with a short timeout
+        let frame_result = {
+            // Create a time-limited attempt to get the lock
+            match capturer.try_lock() {
+                Ok(capturer_guard) => {
+                    // We have the lock, get the frame
+                    capturer_guard.get_next_frame().map_err(|e| anyhow::anyhow!("Frame error: {}", e))
+                },
+                Err(_) => {
+                    // Couldn't get the lock, sleep briefly and check signals
+                    thread::sleep(signal_check_interval);
+                    // Return a special "busy" error that we can handle differently
+                    Err(anyhow::anyhow!("Capturer busy"))
+                }
             }
-        });
+        };
 
-        match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(Frame::YUVFrame(frame))) => {
+        match frame_result {
+            Ok(Frame::YUVFrame(frame)) => {
                 total_frame_count += 1;
                 chunk_frame_count += 1;
                 
@@ -881,28 +942,89 @@ fn capture_display_thread(
                     break;
                 }
             }
-            Ok(Ok(_)) => {}
-
-            Ok(Err(e)) => {
-                eprintln!("Frame error on display {}: {}", display_info.id, e);
-                handle_capture_error(&error_tx);
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // eprintln!("Frame timeout on display {} - ignoring due to idle display", display_info.id);
-                continue;
+            Ok(_) => {
+                // Non-YUV frame, can ignore
             }
             Err(e) => {
-                eprintln!("Channel error on display {}: {}", display_info.id, e);
-                break;
+                let error_msg = e.to_string();
+                if error_msg.contains("Capturer busy") {
+                    // Capturer is just busy, check signals and continue
+                    continue;
+                } else {
+                    // For any other error, just log and continue
+                    // If this is a persistent issue, the session manager will handle it
+                    if error_msg.contains("Timeout") || error_msg.contains("No frames available") {
+                        // These are common errors, no need to log
+                    } else {
+                        // Log uncommon errors
+                        eprintln!("Frame error on display {}: {}", display_info.id, e);
+                    }
+                    
+                    // Check if we should still be running
+                    if !should_run.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    
+                    // Sleep briefly before trying again
+                    thread::sleep(signal_check_interval);
+                    
+                    // Any persistent error will cause the session manager to eventually restart
+                    // Signal an error if we haven't gotten a frame for a long time
+                    if total_frame_count == 0 && start_time.elapsed() > Duration::from_secs(10) {
+                        eprintln!("No frames captured after 10 seconds. Signaling error.");
+                        handle_capture_error(&error_tx);
+                        break;
+                    }
+                    continue;
+                }
             }
         }
     }
 
     // Clean up the ffmpeg process
     if let Some((mut child, stdin)) = ffmpeg_process {
+        // Try to gracefully close the pipe
         drop(stdin);
-        let _ = child.wait();
+        
+        // Wait with timeout
+        let start = Instant::now();
+        let timeout = Duration::from_secs(2);
+        
+        // First try to see if the process is already done
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                // Process already exited
+            },
+            Ok(None) => {
+                // Process still running, wait with timeout
+                let mut exited = false;
+                
+                while start.elapsed() < timeout && !exited {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            exited = true;
+                        },
+                        Ok(None) => {
+                            // Still running, sleep and try again
+                            thread::sleep(Duration::from_millis(100));
+                        },
+                        Err(e) => {
+                            eprintln!("Error checking ffmpeg status: {}", e);
+                            break;
+                        },
+                    }
+                }
+                
+                // If still not exited, force kill
+                if !exited {
+                    eprintln!("Timeout waiting for ffmpeg to finish - killing process");
+                    let _ = child.kill();
+                }
+            },
+            Err(e) => {
+                eprintln!("Error waiting for ffmpeg: {}", e);
+            },
+        }
     }
     
     println!("{} Recording stopped", status_indicator.cyan());
@@ -1282,5 +1404,44 @@ fn write_frame(
     writeln!(frames_log, "{}", timestamp)?;
     frames_log.flush()?;
 
+    Ok(())
+}
+
+// Log system metadata at the session level
+fn log_session_metadata(session_dir: &PathBuf) -> Result<()> {
+    // Initialize system information
+    let mut system = System::new_all();
+    system.refresh_all();
+    
+    // Create a metadata structure
+    let metadata = serde_json::json!({
+        "app_version": CURRENT_VERSION,
+        "timestamp": Local::now().to_rfc3339(),
+        "system_info": {
+            "os_name": System::name().unwrap_or_else(|| "Unknown".to_string()),
+            "os_version": System::os_version().unwrap_or_else(|| "Unknown".to_string()),
+            "kernel_version": System::kernel_version().unwrap_or_else(|| "Unknown".to_string()),
+            "hostname": System::host_name().unwrap_or_else(|| "Unknown".to_string()),
+            "cpu": {
+                "num_physical_cores": system.physical_core_count().unwrap_or(0),
+                "num_total_cores": system.cpus().len(),
+                "model": system.global_cpu_info().name().to_string(),
+            },
+            "memory": {
+                "total_memory_kb": system.total_memory(),
+                "available_memory_kb": system.available_memory(),
+                "used_memory_kb": system.used_memory(),
+            },
+            "screen_recording_permission": check_screen_recording_access(),
+            "input_monitoring_permission": check_input_monitoring_access(),
+        }
+    });
+    
+    // Create the metadata file
+    let metadata_path = session_dir.join("session_metadata.json");
+    let file = File::create(&metadata_path)?;
+    serde_json::to_writer_pretty(file, &metadata)?;
+    
+    println!("{}", "✓ Session metadata logged successfully".green());
     Ok(())
 }
