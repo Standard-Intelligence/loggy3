@@ -370,6 +370,45 @@ impl Session {
             progress_threads: Vec::new(),
         }))
     }
+    
+    // Check if this session has at least one complete chunk (1 minute of recording)
+    fn has_complete_chunks(&self) -> bool {
+        let mut has_chunks = false;
+        
+        // Iterate through each display directory
+        for display in &self.displays {
+            let display_dir = self.session_dir.join(format!("display_{}_{}", display.id, display.title));
+            if !display_dir.exists() {
+                continue;
+            }
+            
+            // Check if there are any chunk files
+            if let Ok(entries) = std::fs::read_dir(&display_dir) {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let file_name = entry.file_name().to_string_lossy().to_string();
+                        
+                        // Check if this is a completed chunk file (not being written)
+                        if file_name.starts_with("chunk_") && file_name.ends_with(".mp4") {
+                            // Check if file size is at least 1MB (reasonable for a complete chunk)
+                            if let Ok(metadata) = entry.metadata() {
+                                if metadata.len() > 1_000_000 {  // 1MB minimum size
+                                    has_chunks = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if has_chunks {
+                break;
+            }
+        }
+        
+        has_chunks
+    }
 
     fn start(&mut self) {
         let sr_clone_el = self.should_run.clone();
@@ -390,7 +429,7 @@ impl Session {
         }
     }
 
-    fn stop(self) {
+    fn stop(self, cleanup_short_sessions: bool) {
         for (flag, handle) in self.capture_threads {
             flag.store(false, Ordering::SeqCst);
             let _ = handle.join();
@@ -412,6 +451,20 @@ impl Session {
         // Stop progress indicator threads
         for handle in self.progress_threads {
             let _ = handle.join();
+        }
+        
+        // Check if this is a short/glitched session that should be cleaned up
+        if cleanup_short_sessions && !self.has_complete_chunks() {
+            println!("{}", "Short recording session detected - cleaning up...".yellow());
+            // Remove the session directory and all its contents
+            if let Err(e) = std::fs::remove_dir_all(&self.session_dir) {
+                if VERBOSE.load(Ordering::SeqCst) {
+                    eprintln!("Failed to clean up short session: {}", e);
+                }
+            } else {
+                println!("{}", "✓ Short session cleaned up".green());
+                return;
+            }
         }
 
         println!("Session stopped: {}", self.session_dir.display());
@@ -525,14 +578,15 @@ pub fn main() -> Result<()> {
     println!("\n{}", "Checking system permissions...".yellow());
     
     // Check Screen Recording permission
-    print!("Screen Recording Permission: ");
+    println!("{}", "Checking Screen Recording Permission...".yellow());
     
     // Use proper screen recording permission check function
     if check_screen_recording_access() {
-        println!("{}", "✓ Enabled".green());
+        println!("{}", "✓ Screen Recording permission is already granted.".green());
     } else {
-        println!("{}", "✗ Disabled".red());
-        println!("{}", "Please enable Screen Recording permission in System Settings > Privacy & Security > Screen Recording".red());
+        println!("{}", "✗ Screen Recording permission is denied.".red());
+        println!("{}", "Please enable it manually in:".yellow());
+        println!("{}", "System Settings → Privacy & Security → Screen Recording".yellow());
         
         // Request permission to trigger the system dialog
         let granted = request_screen_recording_access();
@@ -651,7 +705,10 @@ pub fn main() -> Result<()> {
                     thread::sleep(Duration::from_secs(1));
                 }
 
-                session.stop();
+                // Only cleanup short sessions when we're restarting due to errors or display changes
+                // not when user explicitly stops with Ctrl-C
+                let cleanup_short_sessions = !should_run.load(Ordering::SeqCst);
+                session.stop(cleanup_short_sessions);
             }
             None => {
                 if displays_changed {
