@@ -3,10 +3,10 @@ use chrono::Local;
 use dirs;
 use ctrlc::set_handler;
 use std::{
-    fs::{create_dir_all, File, OpenOptions},
+    fs::{create_dir_all, File},
     io::{BufWriter, Write, BufReader, BufRead, Read},
     path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio, exit},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, channel, Receiver, Sender},
@@ -430,6 +430,11 @@ impl Session {
     }
 
     fn stop(self, cleanup_short_sessions: bool) {
+        // Check for complete chunks before stopping threads 
+        // (we need to do this before moving any part of self)
+        let has_complete_chunks = !cleanup_short_sessions || self.has_complete_chunks();
+        let session_dir = self.session_dir.clone();
+        
         for (flag, handle) in self.capture_threads {
             flag.store(false, Ordering::SeqCst);
             let _ = handle.join();
@@ -449,15 +454,16 @@ impl Session {
         }
 
         // Stop progress indicator threads
+        // We need to take ownership of each handle to join it
         for handle in self.progress_threads {
             let _ = handle.join();
         }
         
         // Check if this is a short/glitched session that should be cleaned up
-        if cleanup_short_sessions && !self.has_complete_chunks() {
+        if cleanup_short_sessions && !has_complete_chunks {
             println!("{}", "Short recording session detected - cleaning up...".yellow());
             // Remove the session directory and all its contents
-            if let Err(e) = std::fs::remove_dir_all(&self.session_dir) {
+            if let Err(e) = std::fs::remove_dir_all(&session_dir) {
                 if VERBOSE.load(Ordering::SeqCst) {
                     eprintln!("Failed to clean up short session: {}", e);
                 }
@@ -467,7 +473,7 @@ impl Session {
             }
         }
 
-        println!("Session stopped: {}", self.session_dir.display());
+        println!("Session stopped: {}", session_dir.display());
     }
 
     fn check_for_errors(&mut self) -> bool {
@@ -1029,7 +1035,7 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
     let temp_path = target_path.with_extension("new");
     
     // Download the new version
-    let mut response = ureq::get(download_url)
+    let response = ureq::get(download_url)
         .call()
         .context("Failed to download update")?;
     
