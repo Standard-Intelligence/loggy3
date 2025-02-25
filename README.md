@@ -1,6 +1,6 @@
 # Loggy3
 
-Loggy3 records your screen and tracks keyboard/mouse actions. Perfect for creating tutorials, documenting your work, or analyzing your computer usage.
+Loggy3 records your screen and tracks keyboard/mouse actions with precise timestamps.
 
 ## Quick Installation Guide
 ```bash
