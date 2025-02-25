@@ -6,7 +6,7 @@ use std::{
     fs::{create_dir_all, File},
     io::{BufWriter, Write, BufReader, BufRead, Read},
     path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio, exit},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, channel, Receiver, Sender},
@@ -1102,8 +1102,9 @@ rm -f "$0"
         println!("{}", "Please restart the application to use the new version.".cyan());
     }
     
-    // Continue running the current version
-    return Ok(());
+    // Exit the program after a successful update
+    println!("{}", "Please restart loggy3 to use the new version.".bright_green().bold());
+    exit(0);
 }
 
 // Save auto-update preferences
