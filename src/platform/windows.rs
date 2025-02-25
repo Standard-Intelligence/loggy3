@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio, exit};
+use std::process::{Child, ChildStdin, Command, Stdio, exit, ExitStatus};
 
 use anyhow::{Context, Result};
 use lazy_static::lazy_static;
@@ -39,10 +39,12 @@ use winapi::um::winuser::{
 use windows_capture;
 use scap::Target;
 
-use super::{DisplayInfo, LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_cache};
+use crate::DisplayInfo;
+use super::{LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_cache};
 
 pub static FFMPEG_ENCODER: &str = "libx264";
 pub static FFMPEG_PIXEL_FORMAT: &str = "bgra";
+pub static FFMPEG_DOWNLOAD_URL: &str = "https://publicr2.standardinternal.com/ffmpeg_binaries/windows_x64/ffmpeg.exe";
 
 
 
@@ -128,8 +130,8 @@ pub fn get_display_info() -> Vec<DisplayInfo> {
             y,
             original_width: width,
             original_height: height,
-            capture_width: width, // On Windows, the capture width is the same as the original width. scap doesn't support scaling.
-            capture_height: height,
+            capture_width: 1280,
+            capture_height: (1280 * height) / width,
         });
     }
 
@@ -546,4 +548,13 @@ pub fn check_and_request_permissions() -> Result<(), String> {
     println!("{}", "You can disable this in your Windows settings.".bright_black());
 
     Ok(())
+}
+
+pub fn execute_shell_command(command: &str, context: &str) -> Result<ExitStatus, anyhow::Error> {
+    let status = Command::new("cmd")
+        .arg("/C") 
+        .arg(&command)
+        .status()
+        .with_context(|| format!("Failed to execute command '{}': {}", command, context))?;
+    Ok(status)
 }
