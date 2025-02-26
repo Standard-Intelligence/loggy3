@@ -1090,10 +1090,12 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
 
 
 fn write_frame_timestamp(frames_log: &mut BufWriter<File>) -> Result<()> {
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)?
-        .as_millis();
-    writeln!(frames_log, "{}", timestamp)?;
+    // Get multi-timestamp and sequence number for robust frame timing
+    let (wall_time, monotonic_time) = platform::get_multi_timestamp();
+    let seq = platform::get_next_sequence();
+    
+    // Log sequence number, wall clock time, and monotonic time
+    writeln!(frames_log, "{}, {}, {}", seq, wall_time, monotonic_time)?;
     frames_log.flush()?;
 
     Ok(())

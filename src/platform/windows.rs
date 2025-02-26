@@ -195,7 +195,7 @@ fn log_mouse_event_cached(event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCa
         RawEvent::Key { timestamp, .. } => *timestamp,
     };
     
-    // Convert the event to a JSON string
+    // Convert the event to a JSON string and add sequence number
     if let Ok(json_string) = serde_json::to_string(event) {
         log_mouse_event_with_cache(timestamp, writer_cache, &json_string);
     }
@@ -203,10 +203,27 @@ fn log_mouse_event_cached(event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCa
 
 /// Log a key event using the writer cache
 fn log_key_event_cached(event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCache>>, pressed_keys: &Arc<Mutex<Vec<String>>>) {
-    if let RawEvent::Key { action, key_code, timestamp } = event {
+    if let RawEvent::Key { action, key_code, timestamp: _ } = event {
         let key_str = format!("VK_{}", key_code);
         let is_press = action == "press";
         
+        // Get multi-timestamp for more robust logging
+        let (wall_time, monotonic_time) = get_multi_timestamp();
+        
+        // Log the raw key event first with sequence number
+        let raw_seq = get_next_sequence();
+        let raw_line = format!("({}, {}, {}, '{}', '{}')", raw_seq, wall_time, monotonic_time, action, key_str);
+        
+        if let Ok(mut cache_lock) = writer_cache.lock() {
+            if let Ok(raw_writer) = cache_lock.get_raw_keypress_writer(wall_time) {
+                if let Ok(mut raw_writer_lock) = raw_writer.lock() {
+                    let _ = writeln!(raw_writer_lock, "{}", raw_line);
+                    let _ = raw_writer_lock.flush();
+                }
+            }
+        }
+        
+        // Continue with the existing state-tracking logic
         let mut keys = pressed_keys.lock().unwrap();
         
         if is_press {
@@ -223,10 +240,11 @@ fn log_key_event_cached(event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCach
             format!("+{}", keys.join("+"))
         };
         
-        let line = format!("({}, '{}')", timestamp, state);
+        let state_seq = get_next_sequence();
+        let line = format!("({}, {}, {}, '{}')", state_seq, wall_time, monotonic_time, state);
         
         if let Ok(mut cache_lock) = writer_cache.lock() {
-            if let Ok(writer) = cache_lock.get_keypress_writer(*timestamp) {
+            if let Ok(writer) = cache_lock.get_keypress_writer(wall_time) {
                 if let Ok(mut writer_lock) = writer.lock() {
                     let _ = writeln!(writer_lock, "{}", line);
                     let _ = writer_lock.flush();
