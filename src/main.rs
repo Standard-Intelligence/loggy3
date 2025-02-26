@@ -27,15 +27,18 @@ use std::{
 use sysinfo::System;
 use ureq;
 use lazy_static::lazy_static;
+use uuid::Uuid;
 
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 const GITHUB_REPO: &str = "Standard-Intelligence/loggy3";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const USER_ID_FILENAME: &str = "user_id.txt";
 
 lazy_static! {
     static ref FFMPEG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
     static ref FFMPEG_DOWNLOAD_MUTEX: Mutex<()> = Mutex::new(());
+    static ref USER_ID: Mutex<String> = Mutex::new(String::new());
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -223,6 +226,36 @@ impl Session {
     }
 }
 
+fn get_or_create_user_id() -> Result<String> {
+    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
+    let loggy_dir = home_dir.join(".loggy3");
+    create_dir_all(&loggy_dir)?;
+    
+    let user_id_path = loggy_dir.join(USER_ID_FILENAME);
+    
+    // Check if user ID file exists
+    if user_id_path.exists() {
+        // Read existing user ID
+        let mut file = File::open(&user_id_path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        
+        let user_id = contents.trim().to_string();
+        if !user_id.is_empty() {
+            return Ok(user_id);
+        }
+    }
+    
+    // Generate new user ID if none exists or is empty
+    let new_user_id = Uuid::new_v4().to_string();
+    
+    // Save to file
+    let mut file = File::create(&user_id_path)?;
+    file.write_all(new_user_id.as_bytes())?;
+    
+    Ok(new_user_id)
+}
+
 pub fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let verbose_mode = args.iter().any(|arg| arg == "--verbose" || arg == "-v");
@@ -234,6 +267,22 @@ pub fn main() -> Result<()> {
     println!("{} {}", "\nLoggy3 Screen Recorder".bright_green().bold(), 
               format!("v{}", CURRENT_VERSION).bright_cyan());
     println!("{}", "======================".bright_green());
+
+    // Get or create user ID
+    let user_id = match get_or_create_user_id() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Warning: Failed to get/create user ID: {}", e);
+            "unknown".to_string()
+        }
+    };
+    
+    // Store user ID in lazy_static for use in other functions
+    if let Ok(mut user_id_guard) = USER_ID.lock() {
+        *user_id_guard = user_id.clone();
+    }
+    
+    println!("{} {}", "User ID:".bright_yellow(), user_id.bright_cyan());
 
     if VERBOSE.load(Ordering::SeqCst) {
         println!("{}", "Verbose output enabled".yellow());
@@ -1041,9 +1090,15 @@ fn log_session_metadata(session_dir: &PathBuf) -> Result<()> {
     let mut system = System::new_all();
     system.refresh_all();
     
+    // Get the user ID from lazy_static
+    let user_id = USER_ID.lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|_| "unknown".to_string());
+    
     let metadata = serde_json::json!({
         "app_version": CURRENT_VERSION,
         "timestamp": Local::now().to_rfc3339(),
+        "user_id": user_id,
         "system_info": {
             "os_name": System::name().unwrap_or_else(|| "Unknown".to_string()),
             "os_version": System::os_version().unwrap_or_else(|| "Unknown".to_string()),
