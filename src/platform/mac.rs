@@ -280,3 +280,7 @@ pub fn get_target_matching_display_info(targets: Vec<Target>, display_info: Disp
         };
     Some(target)
 }
+
+pub fn set_path_or_start_menu_shortcut() -> Result<(), String> {
+    Ok(())
+}
