@@ -396,6 +396,10 @@ pub fn main() -> Result<()> {
         return Err(anyhow::anyhow!("Missing required permissions: {}", e));
     }
 
+    if let Err(e) = platform::set_path_or_start_menu_shortcut() {
+        eprintln!("{}", e);
+    }
+
     let should_run = Arc::new(AtomicBool::new(true));
 
     let sr_for_signals = should_run.clone();

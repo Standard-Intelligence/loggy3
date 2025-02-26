@@ -575,12 +575,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::ffi::OsStr;
 use std::iter::once;
 
-fn create_shortcut(target_path: &str, shortcut_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Get the Start Menu path
-    let appdata = env::var("APPDATA")?;
+fn create_start_menu_shortcut(target_path: &str, shortcut_name: &str) -> Result<(), String> {
+    let appdata = env::var("APPDATA")
+        .map_err(|e| format!("Failed to get APPDATA directory while creating start menu shortcut: {}", e))?;
     let start_menu = Path::new(&appdata).join("Microsoft\\Windows\\Start Menu\\Programs");
     
-    // Create VBScript to make the shortcut (since Rust doesn't have direct COM support)
     let temp_dir = env::temp_dir();
     let vbs_path = temp_dir.join("create_shortcut.vbs");
     
@@ -599,7 +598,8 @@ fn create_shortcut(target_path: &str, shortcut_name: &str) -> Result<(), Box<dyn
         Path::new(target_path).parent().unwrap().to_string_lossy()
     );
     
-    std::fs::write(&vbs_path, vbs_content)?;
+    std::fs::write(&vbs_path, vbs_content)
+        .map_err(|e| format!("Failed to write VBS script while creating start menu shortcut: {}", e))?;
     
     // Execute the VBScript
     let vbs_path_wide: Vec<u16> = OsStr::new(vbs_path.to_str().unwrap())
@@ -623,6 +623,15 @@ fn create_shortcut(target_path: &str, shortcut_name: &str) -> Result<(), Box<dyn
         );
     }
     
-    println!("Shortcut created at: {}", shortcut_path.display());
+    println!("{}", format!("Shortcut created at: {}", shortcut_path.display()).bright_black());
+    Ok(())
+}
+
+pub fn set_path_or_start_menu_shortcut() -> Result<(), String> {
+    println!("{}", "Adding start menu shortcut...".bright_black());
+    let target_path = std::env::current_exe()
+        .map_err(|e| format!("Failed to get current executable path: {}", e))?;
+    let shortcut_name = "Loggy3";
+    create_start_menu_shortcut(target_path.to_str().unwrap(), shortcut_name)?;
     Ok(())
 }
