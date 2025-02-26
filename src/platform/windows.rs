@@ -40,7 +40,7 @@ use windows_capture;
 use scap::Target;
 
 use crate::DisplayInfo;
-use super::{LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_cache};
+use super::{LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_cache, get_multi_timestamp, get_next_sequence};
 
 pub static FFMPEG_ENCODER: &str = "libx264";
 pub static FFMPEG_PIXEL_FORMAT: &str = "bgra";

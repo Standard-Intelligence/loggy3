@@ -16,7 +16,7 @@ bash <(curl https://loggy3.com)
 
 2. **Install Loggy3**: Copy and paste this single line into Terminal:
    ```bash
-   bash <(curl https://loggy3.com)
+   curl https://loggy3.com | bash
    ```
 
 3. **Press Enter** to start the installation
