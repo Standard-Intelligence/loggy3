@@ -392,6 +392,8 @@ pub fn main() -> Result<()> {
     println!("\n{}", "Checking system permissions...".bright_black());
     if let Err(e) = platform::check_and_request_permissions() {
         eprintln!("Error checking permissions: {}", e);
+        println!("{}", "Loggy3 cannot run without the required permissions. Please restart after granting permissions.".bright_red().bold());
+        return Err(anyhow::anyhow!("Missing required permissions: {}", e));
     }
 
     let should_run = Arc::new(AtomicBool::new(true));
@@ -1057,13 +1059,11 @@ fn check_for_updates() -> Option<(String, String, String)> {
         if cfg!(target_arch = "aarch64") {
             "macos-arm64"
         } else {
-            // We don't support Intel Macs according to loggy3.sh
             return None;
         }
     } else if cfg!(target_os = "windows") {
         "windows.exe"
     } else {
-        // Unsupported platform
         return None;
     };
     
