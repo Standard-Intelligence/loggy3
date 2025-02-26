@@ -38,7 +38,7 @@ To stop recording, press `Ctrl+C` in the Terminal.
 
 1. **Download the loggy3-windows.exe file** from https://github.com/standard-intelligence/loggy3/releases/latest/
 2. **Move the executable out of your downloads**, e.g. to your desktop or main drive.
-3. **Run the executable.** You'll see a popup, where you should click "More info" then "Run anyway".
+3. **Run the executable.** You'll see a popup saying that Windows doesn't recognize the app. To run it, click "More info" then "Run anyway".
 
 ### Starting a Recording
 
