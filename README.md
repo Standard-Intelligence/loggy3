@@ -2,10 +2,6 @@
 
 Loggy3 records your screen and tracks keyboard/mouse actions with precise timestamps.
 
-## Quick Installation Guide
-```bash
-bash <(curl https://loggy3.com)
-```
 
 ### For Mac Users
 
