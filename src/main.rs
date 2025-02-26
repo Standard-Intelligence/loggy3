@@ -145,23 +145,36 @@ impl Session {
 
         let session_dir = self.session_dir.clone();
         
-        for (flag, handle) in self.capture_threads {
+        // First set all flags to false to signal threads to stop
+        for (flag, _) in &self.capture_threads {
             flag.store(false, Ordering::SeqCst);
-            
+        }
+        
+        // Wait a moment to allow capturer threads to notice the stop flag
+        // This is critical to avoid the SendError panic
+        thread::sleep(Duration::from_millis(500));
+        
+        // Now attempt to join threads safely
+        for (_, handle) in self.capture_threads {
             let start = Instant::now();
             let timeout = Duration::from_secs(3);
             
             while start.elapsed() < timeout {
                 if handle.is_finished() {
-                    let _ = handle.join();
-                    break;
+                    match handle.join() {
+                        Ok(_) => break,
+                        Err(e) => {
+                            // Safely handle thread panic without propagating it
+                            eprintln!("Screen capture thread ended with error: {:?}", e);
+                            break;
+                        }
+                    }
                 }
                 thread::sleep(Duration::from_millis(100));
             }
             
             if start.elapsed() >= timeout {
-                // TODO: I think that it never actually terminates cleanly with our current approach
-                eprintln!("Screen capture thread closed");
+                eprintln!("Screen capture thread did not exit cleanly within timeout");
             }
         }
 
@@ -171,14 +184,19 @@ impl Session {
 
             while start.elapsed() < timeout {
                 if event_thread.is_finished() {
-                    let _ = event_thread.join();
-                    break;
+                    match event_thread.join() {
+                        Ok(_) => break,
+                        Err(e) => {
+                            eprintln!("Event listener thread ended with error: {:?}", e);
+                            break;
+                        }
+                    }
                 }
                 thread::sleep(Duration::from_millis(100));
             }
             
             if start.elapsed() >= timeout {
-                eprintln!("Event listener thread closed");
+                eprintln!("Event listener thread did not exit cleanly within timeout");
             }
         }
         
@@ -200,9 +218,7 @@ impl Session {
         let session_dir = self.session_dir.clone();
         let error_tx = self.error_tx.clone();
 
-        let handle = thread::spawn(move || {
-            capture_display_thread(sr_clone, display, session_dir, error_tx);
-        });
+        let handle = capture_display_thread(sr_clone, display, session_dir, error_tx);
         self.capture_threads.push((sr_for_thread, handle));
     }
 }
@@ -344,6 +360,17 @@ fn capture_display_thread(
     display_info: DisplayInfo,
     session_dir: PathBuf,
     error_tx: Sender<()>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        capture_display_impl(should_run, display_info, session_dir, error_tx);
+    })
+}
+
+fn capture_display_impl(
+    should_run: Arc<AtomicBool>,
+    display_info: DisplayInfo,
+    session_dir: PathBuf,
+    error_tx: Sender<()>,
 ) {
     println!("{} {} ({} x {})", 
         "Starting capture for display".green(),
@@ -416,10 +443,24 @@ fn capture_display_thread(
         let frame_result = {
             match capturer.try_lock() {
                 Ok(capturer_guard) => {
-                    capturer_guard.get_next_frame().map_err(|e| anyhow::anyhow!("Frame error: {}", e))
+                    // Check if we should still be running before requesting a frame
+                    if !should_run.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    capturer_guard.get_next_frame().map_err(|e| {
+                        if e.to_string().contains("SendError") {
+                            anyhow::anyhow!("Display disconnected or capture interrupted")
+                        } else {
+                            anyhow::anyhow!("Frame error: {}", e)
+                        }
+                    })
                 },
                 Err(_) => {
                     thread::sleep(signal_check_interval);
+                    // Check if we should exit while waiting
+                    if !should_run.load(Ordering::SeqCst) {
+                        break;
+                    }
                     Err(anyhow::anyhow!("Capturer busy"))
                 }
             }
@@ -632,16 +673,21 @@ fn capture_display_thread(
         }
     }
 
-    if let Some((mut child, stdin)) = ffmpeg_process {
+    // Safe shutdown of ffmpeg
+    if let Some((mut child, stdin)) = ffmpeg_process.take() {
+        // First explicitly drop stdin to close the pipe
         drop(stdin);
         
+        // Give ffmpeg time to process remaining frames and shut down
         let start = Instant::now();
         let timeout = Duration::from_secs(2);
         
         match child.try_wait() {
             Ok(Some(_)) => {
+                // Process already exited cleanly
             },
             Ok(None) => {
+                // Process still running, wait for it with timeout
                 let mut exited = false;
                 
                 while start.elapsed() < timeout && !exited {
@@ -660,8 +706,11 @@ fn capture_display_thread(
                 }
                 
                 if !exited {
+                    // Force kill if timeout exceeded
                     eprintln!("Timeout waiting for ffmpeg to finish - killing process");
-                    let _ = child.kill();
+                    if let Err(e) = child.kill() {
+                        eprintln!("Failed to kill ffmpeg process: {}", e);
+                    }
                 }
             },
             Err(e) => {
@@ -669,6 +718,10 @@ fn capture_display_thread(
             },
         }
     }
+    
+    // Clean up the capturer to prevent SendError panics
+    stop_capturer_safely(&capturer);
+    thread::sleep(Duration::from_millis(100));
     
     println!("{} Recording stopped", status_indicator.cyan());
 }
@@ -782,6 +835,21 @@ fn initialize_capturer(target: &Target) -> Option<Arc<Mutex<Capturer>>> {
         Err(e) => {
             eprintln!("Capturer init failed: {}", e);
             None
+        }
+    }
+}
+
+fn stop_capturer_safely(capturer: &Arc<Mutex<Capturer>>) {
+    match capturer.try_lock() {
+        Ok(mut guard) => {
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                guard.stop_capture();
+            })) {
+                eprintln!("Error during capturer cleanup: {:?}", e);
+            }
+        },
+        Err(_) => {
+            eprintln!("Could not obtain lock to safely stop capturer");
         }
     }
 }
