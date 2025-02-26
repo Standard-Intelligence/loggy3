@@ -549,12 +549,3 @@ pub fn check_and_request_permissions() -> Result<(), String> {
 
     Ok(())
 }
-
-pub fn execute_shell_command(command: &str, context: &str) -> Result<ExitStatus, anyhow::Error> {
-    let status = Command::new("cmd")
-        .arg("/C") 
-        .arg(&command)
-        .status()
-        .with_context(|| format!("Failed to execute command '{}': {}", command, context))?;
-    Ok(status)
-}

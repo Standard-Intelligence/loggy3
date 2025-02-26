@@ -936,20 +936,17 @@ fn download_ffmpeg() -> Result<PathBuf> {
         
         let temp_path = loggy_dir.join("ffmpeg.downloading");
         
-        let command = format!(
-            "curl -L -o {} {}",
-            temp_path.display(),
-            platform::FFMPEG_DOWNLOAD_URL
-        );
-
-        println!("{}", command);
+        println!("Downloading from {}", platform::FFMPEG_DOWNLOAD_URL);
         
-        let status = platform::execute_shell_command(&command, "Failed to download ffmpeg binary")?;
+        let response = ureq::get(platform::FFMPEG_DOWNLOAD_URL)
+            .call()
+            .context("Failed to download ffmpeg binary")?;
+        
+        let mut file = File::create(&temp_path).context("Failed to create temporary file")?;
+        let mut buffer = Vec::new();
+        response.into_reader().read_to_end(&mut buffer).context("Failed to read response")?;
+        file.write_all(&buffer).context("Failed to write to temporary file")?;
             
-        if !status.success() {
-            return Err(anyhow::anyhow!("Failed to download ffmpeg binary: {}", status));
-        }
-        
         std::fs::rename(&temp_path, &ffmpeg_path)?;
         println!("Download complete");
         

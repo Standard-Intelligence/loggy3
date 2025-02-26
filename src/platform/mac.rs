@@ -10,7 +10,6 @@ use std::thread;
 use rdev::{listen, Event, EventType};
 use super::{LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_cache};
 use crate::DisplayInfo;
-use std::process::ExitStatus;
 use colored::*;
 
 #[link(name = "IOKit", kind = "framework")]
@@ -280,13 +279,4 @@ pub fn get_target_matching_display_info(targets: Vec<Target>, display_info: Disp
             }
         };
     Some(target)
-}
-
-pub fn execute_shell_command(command: &str, context: &str) -> ExitStatus {
-    let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-        .status()
-        .context(context)?;
-    Ok(status)
 }

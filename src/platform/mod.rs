@@ -9,12 +9,12 @@ use anyhow::Result;
 #[cfg(target_os = "macos")]
 pub mod mac;
 #[cfg(target_os = "macos")]
-pub use mac::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, execute_shell_command, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT, FFMPEG_DOWNLOAD_URL};
+pub use mac::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT, FFMPEG_DOWNLOAD_URL};
 
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, execute_shell_command, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT, FFMPEG_DOWNLOAD_URL};
+pub use windows::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT, FFMPEG_DOWNLOAD_URL};
 
 pub static IS_WINDOWS: bool = cfg!(target_os = "windows");
 
