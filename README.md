@@ -12,7 +12,7 @@ Loggy3 records your screen and tracks keyboard/mouse actions with precise timest
 
 2. **Install Loggy3**: Copy and paste this single line into Terminal:
    ```bash
-   curl https://loggy3.com | bash
+   curl -L loggy3.com/mac | bash
    ```
 
 3. **Press Enter** to start the installation
