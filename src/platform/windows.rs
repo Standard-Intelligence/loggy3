@@ -40,7 +40,7 @@ use windows_capture;
 use scap::Target;
 
 use crate::DisplayInfo;
-use super::{LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_cache};
+use super::{LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_cache, get_multi_timestamp, get_next_sequence};
 
 pub static FFMPEG_ENCODER: &str = "libx264";
 pub static FFMPEG_PIXEL_FORMAT: &str = "bgra";
@@ -562,8 +562,67 @@ pub fn get_target_matching_display_info(targets: Vec<Target>, display_info: Disp
 }
 
 pub fn check_and_request_permissions() -> Result<(), String> {
-    println!("{}", "By default, Windows will display a bright yellow border around the screen when recording is active. This is a security feature to prevent accidental screen recording.".bright_black());
-    println!("{}", "You can disable this in your Windows settings.".bright_black());
+    println!("{}", "Windows will display a bright yellow border around the screen when recording is active.".bright_black());
 
+    Ok(())
+}
+
+
+use std::path::Path;
+use std::env;
+use winapi::um::shellapi::ShellExecuteW;
+use std::os::windows::ffi::OsStrExt;
+use std::ffi::OsStr;
+use std::iter::once;
+
+fn create_shortcut(target_path: &str, shortcut_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Get the Start Menu path
+    let appdata = env::var("APPDATA")?;
+    let start_menu = Path::new(&appdata).join("Microsoft\\Windows\\Start Menu\\Programs");
+    
+    // Create VBScript to make the shortcut (since Rust doesn't have direct COM support)
+    let temp_dir = env::temp_dir();
+    let vbs_path = temp_dir.join("create_shortcut.vbs");
+    
+    let shortcut_path = start_menu.join(format!("{}.lnk", shortcut_name));
+    
+    let vbs_content = format!(
+        "Set WshShell = CreateObject(\"WScript.Shell\")\n\
+         Set Shortcut = WshShell.CreateShortcut(\"{}\")\n\
+         Shortcut.TargetPath = \"{}\"\n\
+         Shortcut.Description = \"{}\"\n\
+         Shortcut.WorkingDirectory = \"{}\"\n\
+         Shortcut.Save",
+        shortcut_path.to_string_lossy(),
+        target_path,
+        shortcut_name,
+        Path::new(target_path).parent().unwrap().to_string_lossy()
+    );
+    
+    std::fs::write(&vbs_path, vbs_content)?;
+    
+    // Execute the VBScript
+    let vbs_path_wide: Vec<u16> = OsStr::new(vbs_path.to_str().unwrap())
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+    
+    let operation: Vec<u16> = OsStr::new("open")
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+        
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            vbs_path_wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1, // SW_SHOWNORMAL
+        );
+    }
+    
+    println!("Shortcut created at: {}", shortcut_path.display());
     Ok(())
 }
