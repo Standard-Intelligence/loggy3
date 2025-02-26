@@ -9,7 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
 jobs:
-  build:
+  build-macos:
     runs-on: macos-latest-xlarge
     steps:
     - uses: actions/checkout@v4
@@ -18,29 +18,48 @@ jobs:
     - name: Upload build artifact
       uses: actions/upload-artifact@v4
       with:
-        name: binary
+        name: binary-macos
         path: target/aarch64-apple-darwin/release/loggy3
         
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: cargo build --verbose --release
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: binary-windows
+        path: target/release/loggy3.exe
+        
   release:
-    needs: build
+    needs: [build-macos, build-windows]
     permissions:
       contents: write
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download build artifact
+      - name: Download macOS build artifact
         uses: actions/download-artifact@v4
         with:
-          name: binary
+          name: binary-macos
           path: ./
-      - name: Make binary executable
+      - name: Download Windows build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-windows
+          path: ./
+      - name: Make macOS binary executable
         run: chmod +x ./loggy3
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          files: ./loggy3
+          files: |
+            ./loggy3
+            ./loggy3.exe
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
