@@ -56,7 +56,9 @@ jobs:
           mv ./loggy3 ./loggy3-macos-arm64
           mv ./loggy3.exe ./loggy3-windows.exe
       - name: Make binaries executable
-        run: chmod +x ./loggy3-macos-arm64
+        run: |
+          chmod +x ./loggy3-macos-arm64
+          chmod +x ./install.sh
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v1
@@ -64,6 +66,7 @@ jobs:
           files: |
             ./loggy3-macos-arm64
             ./loggy3-windows.exe
+            ./install.sh
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
