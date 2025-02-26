@@ -34,11 +34,13 @@ static VERBOSE: AtomicBool = AtomicBool::new(false);
 const GITHUB_REPO: &str = "Standard-Intelligence/loggy3";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const USER_ID_FILENAME: &str = "user_id.txt";
+const USER_EMAIL_FILENAME: &str = "user_email.txt";
 
 lazy_static! {
     static ref FFMPEG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
     static ref FFMPEG_DOWNLOAD_MUTEX: Mutex<()> = Mutex::new(());
     static ref USER_ID: Mutex<String> = Mutex::new(String::new());
+    static ref USER_EMAIL: Mutex<String> = Mutex::new(String::new());
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -256,6 +258,50 @@ fn get_or_create_user_id() -> Result<String> {
     Ok(new_user_id)
 }
 
+fn get_or_prompt_for_email(new_email: Option<String>) -> Result<String> {
+    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
+    let loggy_dir = home_dir.join(".loggy3");
+    create_dir_all(&loggy_dir)?;
+    
+    let email_path = loggy_dir.join(USER_EMAIL_FILENAME);
+    
+    // If new email is provided via command line, update it
+    if let Some(email) = new_email {
+        if !email.trim().is_empty() {
+            let mut file = File::create(&email_path)?;
+            file.write_all(email.trim().as_bytes())?;
+            return Ok(email.trim().to_string());
+        }
+    }
+    
+    // If email file exists, read it
+    if email_path.exists() {
+        let mut file = File::open(&email_path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        
+        let email = contents.trim().to_string();
+        if !email.is_empty() {
+            return Ok(email);
+        }
+    }
+    
+    // If we got here, we need to prompt for an email
+    println!("\n{}", "Please enter your email address (or press Enter to skip):".bright_green());
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    
+    let email = input.trim().to_string();
+    
+    // Only save if user provided something
+    if !email.is_empty() {
+        let mut file = File::create(&email_path)?;
+        file.write_all(email.as_bytes())?;
+    }
+    
+    Ok(email)
+}
+
 pub fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let verbose_mode = args.iter().any(|arg| arg == "--verbose" || arg == "-v");
@@ -263,10 +309,18 @@ pub fn main() -> Result<()> {
     if verbose_mode {
         VERBOSE.store(true, Ordering::SeqCst);
     }
+    
+    // Check for email argument
+    let email_arg = args.iter().position(|arg| arg == "--email" || arg == "-e");
+    let new_email = email_arg.and_then(|pos| args.get(pos + 1).cloned());
 
     println!("{} {}", "\nLoggy3 Screen Recorder".bright_green().bold(), 
               format!("v{}", CURRENT_VERSION).bright_cyan());
     println!("{}", "======================".bright_green());
+    println!("{}", "Usage:".bright_yellow());
+    println!("{}", "  --verbose, -v       Enable verbose output".bright_black());
+    println!("{}", "  --email, -e EMAIL   Set or change your email address".bright_black());
+    println!("");
 
     // Get or create user ID
     let user_id = match get_or_create_user_id() {
@@ -282,8 +336,27 @@ pub fn main() -> Result<()> {
         *user_id_guard = user_id.clone();
     }
     
+    // Get or prompt for email
+    let user_email = match get_or_prompt_for_email(new_email) {
+        Ok(email) => email,
+        Err(e) => {
+            eprintln!("Warning: Failed to get/prompt for email: {}", e);
+            "".to_string()
+        }
+    };
+    
+    // Store email in lazy_static for use in other functions
+    if let Ok(mut user_email_guard) = USER_EMAIL.lock() {
+        *user_email_guard = user_email.clone();
+    }
+    
     println!("{} {}", "User ID:".bright_yellow(), user_id.bright_cyan());
-
+    if !user_email.is_empty() {
+        println!("{} {}", "User Email:".bright_yellow(), user_email.bright_cyan());
+    } else {
+        println!("{} {}", "User Email:".bright_yellow(), "not set (use --email to set)".bright_black());
+    }
+    
     if VERBOSE.load(Ordering::SeqCst) {
         println!("{}", "Verbose output enabled".yellow());
     }
@@ -387,6 +460,15 @@ pub fn main() -> Result<()> {
     }
 
     println!("{}", "Recording stopped. Thank you for using Loggy3!".green().bold());
+    
+    let user_email = USER_EMAIL.lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    
+    if user_email.is_empty() {
+        println!("\n{}", "[Tip] Set your email address: loggy3 --email \"your.email@example.com\"".bright_yellow());
+    }
+    
     Ok(())
 }
 fn get_display_fingerprint() -> String {
@@ -1126,15 +1208,20 @@ fn log_session_metadata(session_dir: &PathBuf) -> Result<()> {
     let mut system = System::new_all();
     system.refresh_all();
     
-    // Get the user ID from lazy_static
+    // Get the user ID and email from lazy_static
     let user_id = USER_ID.lock()
         .map(|guard| guard.clone())
         .unwrap_or_else(|_| "unknown".to_string());
+    
+    let user_email = USER_EMAIL.lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
     
     let metadata = serde_json::json!({
         "app_version": CURRENT_VERSION,
         "timestamp": Local::now().to_rfc3339(),
         "user_id": user_id,
+        "user_email": user_email,
         "system_info": {
             "os_name": System::name().unwrap_or_else(|| "Unknown".to_string()),
             "os_version": System::os_version().unwrap_or_else(|| "Unknown".to_string()),
