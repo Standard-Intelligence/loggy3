@@ -10,6 +10,7 @@ use std::thread;
 use rdev::{listen, Event, EventType};
 use super::{LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_cache};
 use crate::DisplayInfo;
+use std::process::ExitStatus;
 use colored::*;
 
 #[link(name = "IOKit", kind = "framework")]
@@ -52,6 +53,7 @@ fn request_screen_recording_access() -> bool {
 
 pub static FFMPEG_ENCODER: &str = "h264_videotoolbox";
 pub static FFMPEG_PIXEL_FORMAT: &str = "nv12";
+pub static FFMPEG_DOWNLOAD_URL: &str = "https://publicr2.standardinternal.com/ffmpeg_binaries/macos_arm/ffmpeg";
 
 pub fn check_and_request_permissions() -> Result<(), &'static str> {
     println!("{}", "Checking Screen Recording Permission...".bright_black());
@@ -278,4 +280,13 @@ pub fn get_target_matching_display_info(targets: Vec<Target>, display_info: Disp
             }
         };
     Some(target)
+}
+
+pub fn execute_shell_command(command: &str, context: &str) -> ExitStatus {
+    let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+        .status()
+        .context(context)?;
+    Ok(status)
 }
