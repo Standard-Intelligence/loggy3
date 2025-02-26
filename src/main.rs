@@ -392,6 +392,8 @@ pub fn main() -> Result<()> {
     println!("\n{}", "Checking system permissions...".bright_black());
     if let Err(e) = platform::check_and_request_permissions() {
         eprintln!("Error checking permissions: {}", e);
+        println!("{}", "Loggy3 cannot run without the required permissions. Please restart after granting permissions.".bright_red().bold());
+        return Err(anyhow::anyhow!("Missing required permissions: {}", e));
     }
 
     let should_run = Arc::new(AtomicBool::new(true));
