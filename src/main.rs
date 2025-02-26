@@ -970,14 +970,43 @@ fn download_ffmpeg() -> Result<PathBuf> {
 fn check_for_updates() -> Option<(String, String, String)> {
     let api_url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
     
+    // Determine which binary we need for this platform
+    let binary_suffix = if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "macos-arm64"
+        } else {
+            // We don't support Intel Macs according to loggy3.sh
+            return None;
+        }
+    } else if cfg!(target_os = "windows") {
+        "windows.exe"
+    } else {
+        // Unsupported platform
+        return None;
+    };
+    
+    let target_asset_name = format!("loggy3-{}", binary_suffix);
+    
+    if VERBOSE.load(Ordering::SeqCst) {
+        println!("Looking for updates for asset: {}", target_asset_name);
+    }
+    
     match ureq::get(&api_url).call() {
         Ok(response) => {
             if let Ok(release) = response.into_json::<GitHubRelease>() {
                 let latest_version = release.tag_name.trim_start_matches('v').to_string();
                 
                 if is_newer_version(&latest_version, CURRENT_VERSION) {
-                    if let Some(asset) = release.assets.iter().find(|a| a.name == "loggy3") {
+                    // Find the correct asset for the current platform
+                    if let Some(asset) = release.assets.iter().find(|a| a.name == target_asset_name) {
                         return Some((latest_version, asset.browser_download_url.clone(), release.html_url));
+                    } else {
+                        if VERBOSE.load(Ordering::SeqCst) {
+                            println!("No matching asset found for the current platform. Available assets:");
+                            for asset in &release.assets {
+                                println!("- {}", asset.name);
+                            }
+                        }
                     }
                 }
             }
@@ -1022,10 +1051,18 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
     let home_dir = dirs::home_dir().context("Could not determine home directory")?;
     let install_dir = home_dir.join(".local/bin");
     create_dir_all(&install_dir)?;
-    let target_path = install_dir.join("loggy3");
     
+    // Determine the correct binary name based on platform
+    let target_binary_name = if cfg!(target_os = "windows") {
+        "loggy3.exe"
+    } else {
+        "loggy3"
+    };
+    
+    let target_path = install_dir.join(target_binary_name);
     let temp_path = target_path.with_extension("new");
     
+    println!("Downloading from {}", download_url);
     let response = ureq::get(download_url)
         .call()
         .context("Failed to download update")?;
