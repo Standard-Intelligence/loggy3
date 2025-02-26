@@ -1130,18 +1130,7 @@ fn is_newer_version(new_version: &str, current_version: &str) -> bool {
 fn update_to_new_version(download_url: &str) -> Result<()> {
     println!("{}", "Downloading the latest version...".cyan());
     
-    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
-    let install_dir = home_dir.join(".local/bin");
-    create_dir_all(&install_dir)?;
-    
-    // Determine the correct binary name based on platform
-    let target_binary_name = if cfg!(target_os = "windows") {
-        "loggy3.exe"
-    } else {
-        "loggy3"
-    };
-    
-    let target_path = install_dir.join(target_binary_name);
+    let target_path = std::env::current_exe().context("Failed to get current executable path")?;
     let temp_path = target_path.with_extension("new");
     
     println!("Downloading from {}", download_url);
@@ -1162,7 +1151,7 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
         std::fs::set_permissions(&temp_path, perms)?;
     }
     
-    println!("{}", "Installing update...".cyan());
+    println!("{}", format!("Installing update to {}...", target_path.display()).cyan());
     
     std::fs::rename(&temp_path, &target_path)?;
     println!("{}", "✓ Update installed successfully!".green());
