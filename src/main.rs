@@ -1059,13 +1059,11 @@ fn check_for_updates() -> Option<(String, String, String)> {
         if cfg!(target_arch = "aarch64") {
             "macos-arm64"
         } else {
-            // We don't support Intel Macs according to loggy3.sh
             return None;
         }
     } else if cfg!(target_os = "windows") {
         "windows.exe"
     } else {
-        // Unsupported platform
         return None;
     };
     
