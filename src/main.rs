@@ -94,9 +94,9 @@ impl Session {
             return Ok(None);
         }
 
-        let home_dir = dirs::home_dir().context("Could not determine home directory")?;
+        let documents_dir = dirs::document_dir().context("Could not determine documents directory")?;
         let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-        let session_dir = home_dir.join("Documents/loggy3").join(format!("session_{}", timestamp));
+        let session_dir = documents_dir.join("loggy3").join(format!("session_{}", timestamp));
         create_dir_all(&session_dir)?;
 
         println!("\n{}", "=== Starting new recording session ===".cyan().bold());
@@ -198,8 +198,7 @@ impl Session {
                     }
                 }
                 thread::sleep(Duration::from_millis(100));
-            }
-            
+            }            
             if start.elapsed() >= timeout {
                 eprintln!("Event listener thread did not exit cleanly within timeout");
             }
@@ -314,6 +313,27 @@ pub fn main() -> Result<()> {
     
     if verbose_mode {
         VERBOSE.store(true, Ordering::SeqCst);
+    }
+    if platform::IS_WINDOWS {
+        if let Err(e) = platform::check_windows_version_compatibility() {
+            eprintln!("Error: {}", e);
+            return Err(anyhow::anyhow!("Incompatible Windows version: {}", e));
+        }
+        
+        if let Ok(version_type) = platform::get_windows_version_type() {
+            match version_type {
+                platform::WindowsVersionType::Windows10 => {
+                    println!("Running on Windows 10");
+                    colored::control::set_override(false);
+                },
+                platform::WindowsVersionType::Windows11 => {
+                    println!("Running on Windows 11");
+                },
+                _ => {}
+            }
+        } else {
+            eprintln!("Error: Could not determine Windows version");
+        }
     }
     
     // Check for email argument
