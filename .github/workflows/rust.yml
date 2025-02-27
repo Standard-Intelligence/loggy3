@@ -3,7 +3,7 @@ on:
   push:
     branches: [ "main" ]
     tags:
-      - 'v*'
+    - 'v*'
   pull_request:
     branches: [ "main" ]
 env:
@@ -13,61 +13,152 @@ jobs:
     runs-on: macos-latest-xlarge
     steps:
     - uses: actions/checkout@v4
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: aarch64-apple-darwin
+        override: true
+    - name: Cache Dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-
+    - name: Create resources directory and download FFmpeg
+      run: |
+        mkdir -p resources
+        curl -L https://publicr2.standardinternal.com/ffmpeg_binaries/macos/ffmpeg -o resources/ffmpeg
+        chmod +x resources/ffmpeg
+    - name: Configure Cargo for performance
+      run: |
+        mkdir -p ~/.cargo
+        echo "[build]" > ~/.cargo/config.toml
+        echo "rustc-wrapper = \"sccache\"" >> ~/.cargo/config.toml
+        echo "[profile.release]" >> ~/.cargo/config.toml
+        echo "codegen-units = 1" >> ~/.cargo/config.toml
+        echo "lto = \"fat\"" >> ~/.cargo/config.toml
+        echo "opt-level = 3" >> ~/.cargo/config.toml
+    - name: Install sccache
+      run: cargo install sccache --no-default-features
     - name: Build
-      run: cargo build --target aarch64-apple-darwin --verbose --release
+      run: cargo build --target aarch64-apple-darwin --release --jobs $(sysctl -n hw.ncpu)
+      env:
+        RUSTC_WRAPPER: sccache
+        SCCACHE_IDLE_TIMEOUT: 0
     - name: Upload build artifact
       uses: actions/upload-artifact@v4
       with:
         name: loggy3-macos-arm64
         path: target/aarch64-apple-darwin/release/loggy3
-        
+
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-latest-16-core
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose --release
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        components: rustfmt, clippy
+    - name: Cache Dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-
+    - name: Configure Cargo for maximum performance
+      run: |
+        mkdir -Force "$env:USERPROFILE\.cargo"
+        Set-Content -Path "$env:USERPROFILE\.cargo\config.toml" -Value @"
+        [build]
+        rustc-wrapper = "sccache"
+        [profile.release]
+        codegen-units = 1
+        lto = "fat"
+        opt-level = 3
+        panic = "abort"
+        [target.x86_64-pc-windows-msvc]
+        linker = "rust-lld"
+        rustflags = ["-C", "target-cpu=native"]
+        "@
+    - name: Install sccache
+      run: cargo install sccache --no-default-features
+    - name: Create resources directory and download FFmpeg
+      run: |
+        New-Item -ItemType Directory -Force -Path "resources"
+        Write-Host "Downloading Windows FFmpeg binary..."
+        $ProgressPreference = 'SilentlyContinue'  # Speeds up downloads significantly
+        Invoke-WebRequest -Uri "https://publicr2.standardinternal.com/ffmpeg_binaries/windows_x64/ffmpeg.exe" -OutFile "resources/ffmpeg.exe"
+        Write-Host "Download completed"
+        # Verify file was downloaded successfully
+        if (Test-Path "resources/ffmpeg.exe") {
+            $fileSize = (Get-Item "resources/ffmpeg.exe").Length
+            Write-Host "FFmpeg size: $fileSize bytes"
+            if ($fileSize -lt 1000) {
+                Write-Error "FFmpeg download appears corrupted (file too small)"
+                exit 1
+            }
+        } else {
+            Write-Error "FFmpeg download failed - file does not exist"
+            exit 1
+        }
+    - name: Build with maximum parallelism
+      run: |
+        $env:NUMBER_OF_PROCESSORS = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+        Write-Host "Building with $env:NUMBER_OF_PROCESSORS cores"
+        cargo build --release --jobs $env:NUMBER_OF_PROCESSORS
+      env:
+        RUSTC_WRAPPER: sccache
+        SCCACHE_IDLE_TIMEOUT: 0
     - name: Upload build artifact
       uses: actions/upload-artifact@v4
       with:
         name: loggy3-windows
         path: target/release/loggy3.exe
-        
+
   release:
-    needs: [build-macos-arm, build-windows]
+    needs: [ build-macos-arm, build-windows ]
     permissions:
       contents: write
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Download macOS ARM build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: loggy3-macos-arm64
-          path: ./
-      - name: Download Windows build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: loggy3-windows
-          path: ./
-      - name: Rename artifacts for release
-        run: |
-          mv ./loggy3 ./loggy3-macos-arm64
-          mv ./loggy3.exe ./loggy3-windows.exe
-      - name: Make binaries executable
-        run: |
-          chmod +x ./loggy3-macos-arm64
-          chmod +x ./mac-install.sh
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            ./loggy3-macos-arm64
-            ./loggy3-windows.exe
-            ./mac-install.sh
-          name: Release ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
+    - uses: actions/checkout@v4
+    - name: Download macOS ARM build artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: loggy3-macos-arm64
+        path: ./
+    - name: Download Windows build artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: loggy3-windows
+        path: ./
+    - name: Rename artifacts for release
+      run: |
+        mv ./loggy3 ./loggy3-macos-arm64
+        mv ./loggy3.exe ./loggy3-windows.exe
+    - name: Make binaries executable
+      run: |
+        chmod +x ./loggy3-macos-arm64
+        chmod +x ./mac-install.sh
+    - name: Create Release
+      id: create_release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          ./loggy3-macos-arm64
+          ./loggy3-windows.exe
+          ./mac-install.sh
+        name: Release ${{ github.ref_name }}
+        draft: false
+        prerelease: false
+        generate_release_notes: true

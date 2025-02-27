@@ -5,6 +5,7 @@ use chrono::Local;
 use colored::*;
 use ctrlc::set_handler;
 use dirs;
+use platform::EMBEDDED_FFMPEG;
 use scap::{
     capturer::{Capturer, Options, Resolution},
     frame::{Frame, FrameType, YUVFrame, BGRAFrame},
@@ -1014,6 +1015,7 @@ fn stop_capturer_safely(capturer: &Arc<Mutex<Capturer>>) {
     }
 }
 
+
 fn download_ffmpeg() -> Result<PathBuf> {
     if let Ok(ffmpeg_path_guard) = FFMPEG_PATH.lock() {
         if let Some(path) = ffmpeg_path_guard.clone() {
@@ -1041,85 +1043,18 @@ fn download_ffmpeg() -> Result<PathBuf> {
     let loggy_dir = home_dir.join(".loggy3");
     create_dir_all(&loggy_dir)?;
     
-    let ffmpeg_path = loggy_dir.join("ffmpeg");
+    let ffmpeg_path = loggy_dir.join(platform::FFMPEG_FILENAME);
     
     if !ffmpeg_path.exists() {
-        println!("{}", "Downloading ffmpeg binary (required)...".cyan());
+        println!("{}", "Adding ffmpeg binary (required)...".cyan());
         
-        let temp_path = loggy_dir.join("ffmpeg.downloading");
+        let temp_path = loggy_dir.join(format!("{}.downloading", platform::FFMPEG_FILENAME));
         
-        if VERBOSE.load(Ordering::SeqCst) {
-            println!("Downloading from {}", platform::FFMPEG_DOWNLOAD_URL);
-        }
-        
-        // Get the content length for progress tracking
-        let response = match ureq::get(platform::FFMPEG_DOWNLOAD_URL).call() {
-            Ok(resp) => resp,
-            Err(e) => {
-                return Err(anyhow::anyhow!("Failed to download ffmpeg binary: {}. Cannot continue without ffmpeg.", e));
-            }
-        };
-        
-        let content_length = response
-            .header("Content-Length")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        
-        // Create progress bar
-        let pb = if content_length > 0 {
-            let pb = ProgressBar::new(content_length);
-            pb.set_style(ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                .unwrap()
-                .progress_chars("#>-"));
-            pb
-        } else {
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(ProgressStyle::default_spinner()
-                .template("{spinner:.green} [{elapsed_precise}] {bytes} downloaded")
-                .unwrap());
-            pb
-        };
-        
-        let mut file = match File::create(&temp_path) {
-            Ok(file) => file,
-            Err(e) => {
-                pb.finish_with_message("Download failed");
-                return Err(anyhow::anyhow!("Failed to create temporary file: {}. Cannot continue without ffmpeg.", e));
-            }
-        };
-        
-        let mut reader = response.into_reader();
-        let mut buffer = [0; 8192];
-        let mut downloaded = 0;
-        
-        while let Ok(n) = reader.read(&mut buffer) {
-            if n == 0 { break }
+        let mut file = File::create(&temp_path).context("Failed to create temporary file")?;
+        file.write_all(EMBEDDED_FFMPEG).context("Failed to write to temporary file")?;
             
-            if let Err(e) = file.write_all(&buffer[..n]) {
-                pb.finish_with_message("Download failed");
-                return Err(anyhow::anyhow!("Failed to write to temporary file: {}. Cannot continue without ffmpeg.", e));
-            }
-            
-            downloaded += n as u64;
-            pb.set_position(downloaded);
-        }
-        
-        // Flush and close the file
-        if let Err(e) = file.flush() {
-            pb.finish_with_message("Download failed");
-            return Err(anyhow::anyhow!("Failed to flush file: {}. Cannot continue without ffmpeg.", e));
-        }
-        
-        // Make sure we drop the file handle before renaming
-        drop(file);
-        
-        pb.finish_with_message("Download complete");
-            
-        // Rename the temporary file to the final path
-        if let Err(e) = std::fs::rename(&temp_path, &ffmpeg_path) {
-            return Err(anyhow::anyhow!("Failed to rename temporary file: {}. Cannot continue without ffmpeg.", e));
-        }
+        std::fs::rename(&temp_path, &ffmpeg_path)?;
+        println!("Download complete");
         
         #[cfg(unix)]
         {

@@ -52,7 +52,8 @@ fn request_screen_recording_access() -> bool {
 
 pub static FFMPEG_ENCODER: &str = "h264_videotoolbox";
 pub static FFMPEG_PIXEL_FORMAT: &str = "nv12";
-pub static FFMPEG_DOWNLOAD_URL: &str = "https://publicr2.standardinternal.com/ffmpeg_binaries/macos_arm/ffmpeg";
+pub static FFMPEG_FILENAME: &str = "ffmpeg";
+pub static EMBEDDED_FFMPEG: &[u8] = include_bytes!("../../resources/ffmpeg");
 
 pub fn check_and_request_permissions() -> Result<(), &'static str> {
     println!("{}", "Checking Screen Recording Permission...".bright_black());
