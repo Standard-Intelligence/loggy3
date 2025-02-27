@@ -24,11 +24,11 @@ jobs:
 
   build-windows:
     if: github.repository == 'Standard-Intelligence/loggy3'
-    runs-on: fast-windows
+    runs-on: windows-latest
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose --release --jobs 64
+      run: cargo build --verbose --release
     - name: Upload build artifact
       uses: actions/upload-artifact@v4
       with:
