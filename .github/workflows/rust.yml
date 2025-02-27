@@ -15,6 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build
         run: |
+          mkdir -p resources
           curl -L https://publicr2.standardinternal.com/ffmpeg_binaries/macos/ffmpeg -o resources/ffmpeg
           cargo build --target aarch64-apple-darwin --verbose --release
       - name: Upload build artifact
@@ -29,6 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build
         run: |
+          mkdir -p resources
           curl -L https://publicr2.standardinternal.com/ffmpeg_binaries/windows_x64/ffmpeg.exe -o resources/ffmpeg.exe
           cargo build --verbose --release --jobs 16
       - name: Upload build artifact
