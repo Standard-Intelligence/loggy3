@@ -635,3 +635,66 @@ pub fn set_path_or_start_menu_shortcut() -> Result<(), String> {
     create_start_menu_shortcut(target_path.to_str().unwrap(), shortcut_name)?;
     Ok(())
 }
+
+#[derive(Debug)]
+pub struct WindowsVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub build: u32,
+}
+
+pub enum WindowsVersionType {
+    Windows10,
+    Windows11,
+    Unsupported,
+}
+
+pub fn get_windows_version() -> Result<WindowsVersion, String> {
+    // Use RtlGetVersion which is more reliable than GetVersionExW
+    use winapi::shared::ntdef::{NTSTATUS, NT_SUCCESS};
+    use winapi::um::winnt::OSVERSIONINFOW;
+    use ntapi::ntrtl::RtlGetVersion;
+    use std::mem::zeroed;
+
+    unsafe {
+        let mut osvi: OSVERSIONINFOW = zeroed();
+        osvi.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+        
+        let status: NTSTATUS = RtlGetVersion(&mut osvi as *mut _);
+        if !NT_SUCCESS(status) {
+            return Err(format!("RtlGetVersion failed with status: {}", status));
+        }
+        
+        Ok(WindowsVersion {
+            major: osvi.dwMajorVersion,
+            minor: osvi.dwMinorVersion,
+            build: osvi.dwBuildNumber,
+        })
+    }
+}
+
+pub fn get_windows_version_type() -> Result<WindowsVersionType, String> {
+    let version = get_windows_version()?;
+    
+    match (version.major, version.minor, version.build) {
+        // Windows 10
+        (10, 0, _) if version.build < 22000 => Ok(WindowsVersionType::Windows10),
+        
+        // Windows 11 (build number >= 22000)
+        (10, 0, build) if build >= 22000 => Ok(WindowsVersionType::Windows11),
+        
+        // Anything else is not supported
+        _ => Ok(WindowsVersionType::Unsupported),
+    }
+}
+
+pub fn check_windows_version_compatibility() -> Result<(), String> {
+    match get_windows_version_type()? {
+        WindowsVersionType::Windows10 | WindowsVersionType::Windows11 => Ok(()),
+        WindowsVersionType::Unsupported => {
+            let version = get_windows_version()?;
+            Err(format!("Unsupported Windows version: {}.{}.{}. Loggy3 requires Windows 10 or newer.", 
+                version.major, version.minor, version.build))
+        }
+    }
+}

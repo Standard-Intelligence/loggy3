@@ -198,8 +198,7 @@ impl Session {
                     }
                 }
                 thread::sleep(Duration::from_millis(100));
-            }
-            
+            }            
             if start.elapsed() >= timeout {
                 eprintln!("Event listener thread did not exit cleanly within timeout");
             }
@@ -308,6 +307,27 @@ pub fn main() -> Result<()> {
     
     if verbose_mode {
         VERBOSE.store(true, Ordering::SeqCst);
+    }
+    if platform::IS_WINDOWS {
+        if let Err(e) = platform::check_windows_version_compatibility() {
+            eprintln!("Error: {}", e);
+            return Err(anyhow::anyhow!("Incompatible Windows version: {}", e));
+        }
+        
+        if let Ok(version_type) = platform::get_windows_version_type() {
+            match version_type {
+                platform::WindowsVersionType::Windows10 => {
+                    println!("Running on Windows 10");
+                    colored::control::set_override(false);
+                },
+                platform::WindowsVersionType::Windows11 => {
+                    println!("Running on Windows 11");
+                },
+                _ => {}
+            }
+        } else {
+            eprintln!("Error: Could not determine Windows version");
+        }
     }
     
     // Check for email argument
