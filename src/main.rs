@@ -280,7 +280,7 @@ fn get_or_prompt_for_email() -> Result<String> {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         
-        let email = input.trim().to_string();
+        let email = input.trim().to_lowercase();
         
         if email.is_empty() {
             println!("{}", "Identifier cannot be empty. Please try again.".bright_red());
