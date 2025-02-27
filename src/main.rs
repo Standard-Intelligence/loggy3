@@ -37,13 +37,11 @@ static VERBOSE: AtomicBool = AtomicBool::new(false);
 const GITHUB_REPO: &str = "Standard-Intelligence/loggy3";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const USER_ID_FILENAME: &str = "user_id.txt";
-const USER_EMAIL_FILENAME: &str = "user_email.txt";
 
 lazy_static! {
     static ref FFMPEG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
     static ref FFMPEG_DOWNLOAD_MUTEX: Mutex<()> = Mutex::new(());
     static ref USER_ID: Mutex<String> = Mutex::new(String::new());
-    static ref USER_EMAIL: Mutex<String> = Mutex::new(String::new());
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -263,44 +261,6 @@ fn get_or_create_user_id() -> Result<String> {
     Ok(new_user_id)
 }
 
-fn get_or_prompt_for_email() -> Result<String> {
-    let home_dir = dirs::home_dir().context("Could not determine home directory")?;
-    let loggy_dir = home_dir.join(".loggy3");
-    create_dir_all(&loggy_dir)?;
-    
-    let email_path = loggy_dir.join(USER_EMAIL_FILENAME);
-    
-    // If email file exists, read it
-    if email_path.exists() {
-        let mut file = File::open(&email_path)?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
-        
-        let email = contents.trim().to_string();
-        if !email.is_empty() {
-            return Ok(email);
-        }
-    }
-    
-    loop {
-        println!("\n{}", "Please enter an email address or username to identify your logs:".bright_green());
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        
-        let email = input.trim().to_lowercase();
-        
-        if email.is_empty() {
-            println!("{}", "Identifier cannot be empty. Please try again.".bright_red());
-            continue;
-        }
-        
-        let mut file = File::create(&email_path)?;
-        file.write_all(email.as_bytes())?;
-        
-        return Ok(email);
-    }
-}
-
 fn check_for_running_instance() -> Result<std::fs::File, String> {
     let home_dir = match dirs::home_dir() {
         Some(dir) => dir,
@@ -403,22 +363,7 @@ pub fn main() -> Result<()> {
         *user_id_guard = user_id.clone();
     }
     
-    // Get or prompt for email (now required)
-    let user_email = match get_or_prompt_for_email() {
-        Ok(email) => email,
-        Err(e) => {
-            eprintln!("Error: Failed to get/prompt for email: {}", e);
-            return Err(anyhow::anyhow!("Email is required to use Loggy3: {}", e));
-        }
-    };
-    
-    // Store email in lazy_static for use in other functions
-    if let Ok(mut user_email_guard) = USER_EMAIL.lock() {
-        *user_email_guard = user_email.clone();
-    }
-    
     println!("{} {}", "User ID:".bright_yellow(), user_id.bright_cyan());
-    println!("{} {}", "User Email:".bright_yellow(), user_email.bright_cyan());
     
     if VERBOSE.load(Ordering::SeqCst) {
         println!("{}", "Verbose output enabled".yellow());
@@ -545,14 +490,6 @@ pub fn main() -> Result<()> {
     }
 
     println!("{}", "Recording stopped. Thank you for using Loggy3!".green().bold());
-    
-    let user_email = USER_EMAIL.lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
-    
-    if user_email.is_empty() {
-        println!("\n{}", "[Tip] Set your email address: loggy3 --email \"your.email@example.com\"".bright_yellow());
-    }
     
     Ok(())
 }
@@ -1357,20 +1294,15 @@ fn log_session_metadata(session_dir: &PathBuf) -> Result<()> {
     let mut system = System::new_all();
     system.refresh_all();
     
-    // Get the user ID and email from lazy_static
+    // Get the user ID from lazy_static
     let user_id = USER_ID.lock()
         .map(|guard| guard.clone())
         .unwrap_or_else(|_| "unknown".to_string());
-    
-    let user_email = USER_EMAIL.lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
     
     let metadata = serde_json::json!({
         "app_version": CURRENT_VERSION,
         "timestamp": Local::now().to_rfc3339(),
         "user_id": user_id,
-        "user_email": user_email,
         "system_info": {
             "os_name": System::name().unwrap_or_else(|| "Unknown".to_string()),
             "os_version": System::os_version().unwrap_or_else(|| "Unknown".to_string()),
