@@ -30,6 +30,7 @@ use ureq;
 use lazy_static::lazy_static;
 use uuid::Uuid;
 use indicatif::{ProgressBar, ProgressStyle};
+use fs2;
 
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
@@ -319,42 +320,22 @@ fn check_for_running_instance() -> Result<std::fs::File, String> {
         .create(true)
         .open(&lock_path)
     {
-        Ok(mut file) => {
-            // Try to get an exclusive lock
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::AsRawFd;
-                
-                let lock_result = unsafe {
-                    libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
-                };
-                
-                if lock_result != 0 {
+        Ok(file) => {
+            // Try to get an exclusive lock using fs2
+            let mut file = file; // Make file mutable
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(_) => {
+                    // Write PID to the lock file
+                    if let Err(e) = std::io::Write::write_all(&mut file, std::process::id().to_string().as_bytes()) {
+                        return Err(format!("Could not write to lock file: {}", e));
+                    }
+                    
+                    Ok(file)
+                },
+                Err(_) => {
                     return Err("Another instance of Loggy3 is already running.".to_string());
                 }
             }
-            
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::AsRawHandle;
-                use winapi::um::fileapi::LockFile;
-                
-                let handle = file.as_raw_handle();
-                let result = unsafe {
-                    LockFile(handle, 0, 0, 1, 0)
-                };
-                
-                if result == 0 {
-                    return Err("Another instance of Loggy3 is already running.".to_string());
-                }
-            }
-            
-            // Write PID to the lock file
-            if let Err(e) = std::io::Write::write_all(&mut file, std::process::id().to_string().as_bytes()) {
-                return Err(format!("Could not write to lock file: {}", e));
-            }
-            
-            Ok(file)
         }
         Err(e) => Err(format!("Could not open lock file: {}", e)),
     }
