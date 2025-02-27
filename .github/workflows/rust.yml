@@ -25,7 +25,7 @@ jobs:
         path: target/aarch64-apple-darwin/release/loggy3
 
   build-windows:
-    runs-on: windows-latest-16-cores
+    runs-on: fast-windows
     steps:
     - uses: actions/checkout@v4
     - name: Build
