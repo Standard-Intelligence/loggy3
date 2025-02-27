@@ -45,7 +45,7 @@ use super::{LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_ca
 pub static FFMPEG_ENCODER: &str = "libx264";
 pub static FFMPEG_PIXEL_FORMAT: &str = "bgra";
 pub static FFMPEG_FILENAME: &str = "ffmpeg.exe";
-pub static EMBEDDED_FFMPEG: &[u8] = include_bytes!("../../resources/ffmpeg.exe");
+pub static FFMPEG_DOWNLOAD_URL: &str = "https://publicr2.standardinternal.com/ffmpeg_binaries/windows_x64/ffmpeg.exe";
 
 
 // A small helper to store the raw monitor data after enumeration

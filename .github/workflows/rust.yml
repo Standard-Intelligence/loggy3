@@ -3,7 +3,7 @@ on:
   push:
     branches: [ "main" ]
     tags:
-    - "v*"
+    - 'v*'
   pull_request:
     branches: [ "main" ]
 env:
@@ -15,10 +15,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: |
-        mkdir -p resources
-        curl -L https://publicr2.standardinternal.com/ffmpeg_binaries/macos/ffmpeg -o resources/ffmpeg
-        cargo build --target aarch64-apple-darwin --verbose --release
+      run: cargo build --target aarch64-apple-darwin --verbose --release
     - name: Upload build artifact
       uses: actions/upload-artifact@v4
       with:
@@ -31,10 +28,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: |
-        mkdir -p resources
-        curl -L https://publicr2.standardinternal.com/ffmpeg_binaries/windows_x64/ffmpeg.exe -o resources/ffmpeg.exe
-        cargo build --verbose --release --jobs 16
+      run: cargo build --verbose --release --jobs 64
     - name: Upload build artifact
       uses: actions/upload-artifact@v4
       with:

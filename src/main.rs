@@ -5,7 +5,6 @@ use chrono::Local;
 use colored::*;
 use ctrlc::set_handler;
 use dirs;
-use platform::EMBEDDED_FFMPEG;
 use scap::{
     capturer::{Capturer, Options, Resolution},
     frame::{Frame, FrameType, YUVFrame, BGRAFrame},
@@ -97,7 +96,6 @@ impl Session {
 
         let documents_dir = dirs::document_dir().context("Could not determine documents directory")?;
         
-        // Add a UUID to the session folder name for uniqueness
         let random_id = uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("").to_string();
         let timestamp = Local::now().format("%Y%m%d_%H%M%S");
         let session_dir = documents_dir.join("loggy3").join(format!("session_{}_{}", timestamp, random_id));
@@ -155,16 +153,12 @@ impl Session {
 
         let session_dir = self.session_dir.clone();
         
-        // First set all flags to false to signal threads to stop
         for (flag, _) in &self.capture_threads {
             flag.store(false, Ordering::SeqCst);
         }
         
-        // Wait a moment to allow capturer threads to notice the stop flag
-        // This is critical to avoid the SendError panic
         thread::sleep(Duration::from_millis(500));
         
-        // Now attempt to join threads safely
         for (_, handle) in self.capture_threads {
             let start = Instant::now();
             let timeout = Duration::from_secs(3);
@@ -174,7 +168,6 @@ impl Session {
                     match handle.join() {
                         Ok(_) => break,
                         Err(e) => {
-                            // Safely handle thread panic without propagating it
                             eprintln!("Screen capture thread ended with error: {:?}", e);
                             break;
                         }
@@ -238,9 +231,7 @@ fn get_or_create_user_id() -> Result<String> {
     
     let user_id_path = loggy_dir.join(USER_ID_FILENAME);
     
-    // Check if user ID file exists
     if user_id_path.exists() {
-        // Read existing user ID
         let mut file = File::open(&user_id_path)?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
@@ -251,10 +242,8 @@ fn get_or_create_user_id() -> Result<String> {
         }
     }
     
-    // Generate new user ID if none exists or is empty
     let new_user_id = Uuid::new_v4().to_string();
     
-    // Save to file
     let mut file = File::create(&user_id_path)?;
     file.write_all(new_user_id.as_bytes())?;
     
@@ -274,18 +263,15 @@ fn check_for_running_instance() -> Result<std::fs::File, String> {
     
     let lock_path = lock_dir.join("loggy3.lock");
     
-    // Attempt to create and lock the file
     match std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .open(&lock_path)
     {
         Ok(file) => {
-            // Try to get an exclusive lock using fs2
-            let mut file = file; // Make file mutable
+            let mut file = file;
             match fs2::FileExt::try_lock_exclusive(&file) {
                 Ok(_) => {
-                    // Write PID to the lock file
                     if let Err(e) = std::io::Write::write_all(&mut file, std::process::id().to_string().as_bytes()) {
                         return Err(format!("Could not write to lock file: {}", e));
                     }
@@ -302,7 +288,6 @@ fn check_for_running_instance() -> Result<std::fs::File, String> {
 }
 
 pub fn main() -> Result<()> {
-    // Keep the lock file alive for the duration of the program
     let _lock_file = match check_for_running_instance() {
         Ok(file) => file,
         Err(e) => {
@@ -349,7 +334,6 @@ pub fn main() -> Result<()> {
     println!("{}", "  --force-update, -u  Force update to latest version".bright_black());
     println!("");
 
-    // Get or create user ID
     let user_id = match get_or_create_user_id() {
         Ok(id) => id,
         Err(e) => {
@@ -358,7 +342,6 @@ pub fn main() -> Result<()> {
         }
     };
     
-    // Store user ID in lazy_static for use in other functions
     if let Ok(mut user_id_guard) = USER_ID.lock() {
         *user_id_guard = user_id.clone();
     }
@@ -542,7 +525,7 @@ fn capture_display_impl(
     };
 
     let (capturer_width, capturer_height) = if platform::IS_WINDOWS {
-        (display_info.original_width, display_info.original_height) // No matter what we ask scap, Windows will capture at the original resolution.
+        (display_info.original_width, display_info.original_height)
     } else {
         match capturer.lock() {
             Ok(mut c) => {
@@ -596,7 +579,6 @@ fn capture_display_impl(
         let frame_result = {
             match capturer.try_lock() {
                 Ok(capturer_guard) => {
-                    // Check if we should still be running before requesting a frame
                     if !should_run.load(Ordering::SeqCst) {
                         break;
                     }
@@ -610,7 +592,6 @@ fn capture_display_impl(
                 },
                 Err(_) => {
                     thread::sleep(signal_check_interval);
-                    // Check if we should exit while waiting
                     if !should_run.load(Ordering::SeqCst) {
                         break;
                     }
@@ -826,21 +807,16 @@ fn capture_display_impl(
         }
     }
 
-    // Safe shutdown of ffmpeg
     if let Some((mut child, stdin)) = ffmpeg_process.take() {
-        // First explicitly drop stdin to close the pipe
         drop(stdin);
         
-        // Give ffmpeg time to process remaining frames and shut down
         let start = Instant::now();
         let timeout = Duration::from_secs(2);
         
         match child.try_wait() {
             Ok(Some(_)) => {
-                // Process already exited cleanly
             },
             Ok(None) => {
-                // Process still running, wait for it with timeout
                 let mut exited = false;
                 
                 while start.elapsed() < timeout && !exited {
@@ -859,7 +835,6 @@ fn capture_display_impl(
                 }
                 
                 if !exited {
-                    // Force kill if timeout exceeded
                     eprintln!("Timeout waiting for ffmpeg to finish - killing process");
                     if let Err(e) = child.kill() {
                         eprintln!("Failed to kill ffmpeg process: {}", e);
@@ -872,7 +847,6 @@ fn capture_display_impl(
         }
     }
     
-    // Clean up the capturer to prevent SendError panics
     stop_capturer_safely(&capturer);
     thread::sleep(Duration::from_millis(100));
     
@@ -1022,7 +996,6 @@ fn download_ffmpeg() -> Result<PathBuf> {
         Err(e) => return Err(anyhow::anyhow!("Failed to acquire download mutex: {}", e)),
     };
 
-    // Re-check after acquiring the lock in case another thread downloaded it
     if let Ok(ffmpeg_path_guard) = FFMPEG_PATH.lock() {
         if let Some(path) = ffmpeg_path_guard.clone() {
             if path.exists() {
@@ -1038,38 +1011,83 @@ fn download_ffmpeg() -> Result<PathBuf> {
     let ffmpeg_path = loggy_dir.join(platform::FFMPEG_FILENAME);
     
     if !ffmpeg_path.exists() {
-        println!("{}", "Adding ffmpeg binary (required)...".cyan());
+        println!("{}", "Downloading ffmpeg binary (required)...".cyan());
         
-        let temp_path = loggy_dir.join(format!("{}.downloading", platform::FFMPEG_FILENAME));
+        let temp_path = loggy_dir.join("ffmpeg.downloading");
         
-        let mut file = File::create(&temp_path).context("Failed to create temporary file")?;
-        file.write_all(EMBEDDED_FFMPEG).context("Failed to write to temporary file")?;
-            
-        std::fs::rename(&temp_path, &ffmpeg_path)?;
-        println!("Download complete");
+        if VERBOSE.load(Ordering::SeqCst) {
+            println!("Downloading from {}", platform::FFMPEG_DOWNLOAD_URL);
+        }
         
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = match std::fs::metadata(&ffmpeg_path) {
-                Ok(meta) => meta.permissions(),
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Failed to get file permissions: {}. Cannot continue without ffmpeg.", e));
-                }
-            };
-            perms.set_mode(0o755);
-            if let Err(e) = std::fs::set_permissions(&ffmpeg_path, perms) {
-                return Err(anyhow::anyhow!("Failed to set file permissions: {}. Cannot continue without ffmpeg.", e));
+        let response = match ureq::get(platform::FFMPEG_DOWNLOAD_URL).call() {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to download ffmpeg binary: {}. Cannot continue without ffmpeg.", e));
             }
+        };
+        
+        let content_length = response
+            .header("Content-Length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        
+        let pb = if content_length > 0 {
+            let pb = ProgressBar::new(content_length);
+            pb.set_style(ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"));
+            pb
+        } else {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(ProgressStyle::default_spinner()
+                .template("{spinner:.green} [{elapsed_precise}] {bytes} downloaded")
+                .unwrap());
+            pb
+        };
+        
+        let mut file = match File::create(&temp_path) {
+            Ok(file) => file,
+            Err(e) => {
+                pb.finish_with_message("Download failed");
+                return Err(anyhow::anyhow!("Failed to create temporary file: {}. Cannot continue without ffmpeg.", e));
+            }
+        };
+        
+        let mut reader = response.into_reader();
+        let mut buffer = [0; 8192];
+        let mut downloaded = 0;
+        
+        while let Ok(n) = reader.read(&mut buffer) {
+            if n == 0 { break }
+            
+            if let Err(e) = file.write_all(&buffer[..n]) {
+                pb.finish_with_message("Download failed");
+                return Err(anyhow::anyhow!("Failed to write to temporary file: {}. Cannot continue without ffmpeg.", e));
+            }
+            
+            downloaded += n as u64;
+            pb.set_position(downloaded);
+        }
+        
+        if let Err(e) = file.flush() {
+            pb.finish_with_message("Download failed");
+            return Err(anyhow::anyhow!("Failed to flush file: {}. Cannot continue without ffmpeg.", e));
+        }
+        
+        drop(file);
+        
+        pb.finish_with_message("Download complete");
+        
+        if let Err(e) = std::fs::rename(&temp_path, &ffmpeg_path) {
+            return Err(anyhow::anyhow!("Failed to rename temporary file: {}. Cannot continue without ffmpeg.", e));
         }
     }
     
-    // Verify the file exists and is executable
     if !ffmpeg_path.exists() {
         return Err(anyhow::anyhow!("FFmpeg binary does not exist after download. Cannot continue."));
     }
     
-    // Update the global cache with the path
     if let Ok(mut ffmpeg_path_guard) = FFMPEG_PATH.lock() {
         *ffmpeg_path_guard = Some(ffmpeg_path.clone());
     }
@@ -1080,7 +1098,6 @@ fn download_ffmpeg() -> Result<PathBuf> {
 fn check_for_updates(force_update: bool) -> Option<(String, String, String)> {
     let api_url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
     
-    // Determine which binary we need for this platform
     let binary_suffix = if cfg!(target_os = "macos") {
         if cfg!(target_arch = "aarch64") {
             "macos-arm64"
@@ -1104,9 +1121,7 @@ fn check_for_updates(force_update: bool) -> Option<(String, String, String)> {
             if let Ok(release) = response.into_json::<GitHubRelease>() {
                 let latest_version = release.tag_name.trim_start_matches('v').to_string();
                 
-                // If force update is enabled or we have a newer version
                 if force_update || is_newer_version(&latest_version, CURRENT_VERSION) {
-                    // Find the correct asset for the current platform
                     if let Some(asset) = release.assets.iter().find(|a| a.name == target_asset_name) {
                         return Some((latest_version, asset.browser_download_url.clone(), release.html_url));
                     } else {
@@ -1166,7 +1181,6 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
         println!("Downloading from {}", download_url);
     }
     
-    // Get the content length for progress tracking
     let response = match ureq::get(download_url).call() {
         Ok(resp) => resp,
         Err(e) => {
@@ -1179,7 +1193,6 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
     
-    // Create progress bar
     let pb = if content_length > 0 {
         let pb = ProgressBar::new(content_length);
         pb.set_style(ProgressStyle::default_bar()
@@ -1219,13 +1232,11 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
         pb.set_position(downloaded);
     }
     
-    // Flush and close the file
     if let Err(e) = file.flush() {
         pb.finish_with_message("Download failed");
         return Err(anyhow::anyhow!("Failed to flush file: {}", e));
     }
     
-    // Make sure we drop the file handle before renaming
     drop(file);
     
     pb.finish_with_message("Download complete");
@@ -1258,11 +1269,9 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
 
 
 fn write_frame_timestamp(frames_log: &mut BufWriter<File>) -> Result<()> {
-    // Get multi-timestamp and sequence number for robust frame timing
     let (wall_time, monotonic_time) = platform::get_multi_timestamp();
     let seq = platform::get_next_sequence();
     
-    // Log sequence number, wall clock time, and monotonic time
     writeln!(frames_log, "{}, {}, {}", seq, wall_time, monotonic_time)?;
     frames_log.flush()?;
 
@@ -1294,7 +1303,6 @@ fn log_session_metadata(session_dir: &PathBuf) -> Result<()> {
     let mut system = System::new_all();
     system.refresh_all();
     
-    // Get the user ID from lazy_static
     let user_id = USER_ID.lock()
         .map(|guard| guard.clone())
         .unwrap_or_else(|_| "unknown".to_string());

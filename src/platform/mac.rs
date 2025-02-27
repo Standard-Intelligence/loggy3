@@ -30,10 +30,10 @@ pub fn check_input_monitoring_access() -> Option<bool> {
     unsafe {
         let status = IOHIDCheckAccess(KIOHID_REQUEST_TYPE_LISTEN_EVENT);
         match status {
-            0 => Some(true),  // Granted
-            1 => Some(false), // Denied
-            2 => None,        // Not determined yet
-            _ => None,        // Any unexpected value -> treat like "unknown"
+            0 => Some(true),
+            1 => Some(false),
+            2 => None,
+            _ => None,
         }
     }
 }
@@ -53,7 +53,7 @@ fn request_screen_recording_access() -> bool {
 pub static FFMPEG_ENCODER: &str = "h264_videotoolbox";
 pub static FFMPEG_PIXEL_FORMAT: &str = "nv12";
 pub static FFMPEG_FILENAME: &str = "ffmpeg";
-pub static EMBEDDED_FFMPEG: &[u8] = include_bytes!("../../resources/ffmpeg");
+pub static FFMPEG_DOWNLOAD_URL: &str = "https://publicr2.standardinternal.com/ffmpeg_binaries/macos_arm/ffmpeg";
 
 pub fn check_and_request_permissions() -> Result<(), &'static str> {
     println!("{}", "Checking Screen Recording Permission...".bright_black());

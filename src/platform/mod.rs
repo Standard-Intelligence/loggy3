@@ -8,20 +8,16 @@ use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use colored::*;
 use anyhow::Result;
 
-// Global atomic sequence counter for all input events
 static EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-// Global timer start point for monotonic clock reference
 lazy_static::lazy_static! {
     static ref MONOTONIC_START: Instant = Instant::now();
 }
 
-// Helper function to get the next sequence number
 pub fn get_next_sequence() -> u64 {
     EVENT_SEQUENCE.fetch_add(1, Ordering::SeqCst)
 }
 
-// Get multiple timestamps for more robust time tracking
 pub fn get_multi_timestamp() -> (u128, u64) {
     let wall_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -36,12 +32,12 @@ pub fn get_multi_timestamp() -> (u128, u64) {
 #[cfg(target_os = "macos")]
 pub mod mac;
 #[cfg(target_os = "macos")]
-pub use mac::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, set_path_or_start_menu_shortcut, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT, FFMPEG_FILENAME, EMBEDDED_FFMPEG};
+pub use mac::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, set_path_or_start_menu_shortcut, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT, FFMPEG_FILENAME, FFMPEG_DOWNLOAD_URL};
 
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, set_path_or_start_menu_shortcut, get_windows_version_type, check_windows_version_compatibility, WindowsVersionType, WindowsVersion, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT, FFMPEG_FILENAME, EMBEDDED_FFMPEG};
+pub use windows::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, set_path_or_start_menu_shortcut, get_windows_version_type, check_windows_version_compatibility, WindowsVersionType, WindowsVersion, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT, FFMPEG_FILENAME, FFMPEG_DOWNLOAD_URL};
 
 #[cfg(target_os = "macos")]
 pub static IS_WINDOWS: bool = false;
@@ -133,10 +129,8 @@ fn handle_key_event_with_cache(
 ) {
     let key_str = format!("{:?}", key);
     
-    // Get multi-timestamp for more robust logging
     let (wall_time, monotonic_time) = get_multi_timestamp();
     
-    // Log the raw key event first with sequence number and multi-timestamp
     let action = if is_press { "press" } else { "release" };
     let raw_seq = get_next_sequence();
     let raw_line = format!("({}, {}, {}, '{}', '{}')\n", raw_seq, wall_time, monotonic_time, action, key_str);
@@ -150,7 +144,6 @@ fn handle_key_event_with_cache(
         }
     }
     
-    // Continue with the existing state-tracking logic
     let mut keys = pressed_keys.lock().unwrap();
 
     if is_press {
@@ -167,7 +160,6 @@ fn handle_key_event_with_cache(
         format!("+{}", keys.join("+"))
     };
 
-    // Use a different sequence number for the state event
     let state_seq = get_next_sequence();
     let line = format!("({}, {}, {}, '{}')\n", state_seq, wall_time, monotonic_time, state);
     
