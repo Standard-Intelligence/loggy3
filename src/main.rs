@@ -308,7 +308,7 @@ pub fn main() -> Result<()> {
     if verbose_mode {
         VERBOSE.store(true, Ordering::SeqCst);
     }
-    if platform::IS_WINDOWS {
+    #[cfg(target_os = "windows")] {
         if let Err(e) = platform::check_windows_version_compatibility() {
             eprintln!("Error: {}", e);
             return Err(anyhow::anyhow!("Incompatible Windows version: {}", e));
