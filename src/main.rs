@@ -97,8 +97,12 @@ impl Session {
         }
 
         let documents_dir = dirs::document_dir().context("Could not determine documents directory")?;
+        
+        // Add a UUID to the session folder name for uniqueness
+        let random_id = uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("").to_string();
         let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-        let session_dir = documents_dir.join("loggy3").join(format!("session_{}", timestamp));
+        let session_dir = documents_dir.join("loggy3").join(format!("session_{}_{}", timestamp, random_id));
+        
         create_dir_all(&session_dir)?;
 
         println!("\n{}", "=== Starting new recording session ===".cyan().bold());
@@ -296,7 +300,77 @@ fn get_or_prompt_for_email() -> Result<String> {
     }
 }
 
+fn check_for_running_instance() -> Result<std::fs::File, String> {
+    let home_dir = match dirs::home_dir() {
+        Some(dir) => dir,
+        None => return Err("Could not determine home directory".to_string()),
+    };
+    
+    let lock_dir = home_dir.join(".loggy3");
+    if let Err(e) = std::fs::create_dir_all(&lock_dir) {
+        return Err(format!("Could not create lock directory: {}", e));
+    }
+    
+    let lock_path = lock_dir.join("loggy3.lock");
+    
+    // Attempt to create and lock the file
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+    {
+        Ok(mut file) => {
+            // Try to get an exclusive lock
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                
+                let lock_result = unsafe {
+                    libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+                };
+                
+                if lock_result != 0 {
+                    return Err("Another instance of Loggy3 is already running.".to_string());
+                }
+            }
+            
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                use winapi::um::fileapi::LockFile;
+                
+                let handle = file.as_raw_handle();
+                let result = unsafe {
+                    LockFile(handle, 0, 0, 1, 0)
+                };
+                
+                if result == 0 {
+                    return Err("Another instance of Loggy3 is already running.".to_string());
+                }
+            }
+            
+            // Write PID to the lock file
+            if let Err(e) = std::io::Write::write_all(&mut file, std::process::id().to_string().as_bytes()) {
+                return Err(format!("Could not write to lock file: {}", e));
+            }
+            
+            Ok(file)
+        }
+        Err(e) => Err(format!("Could not open lock file: {}", e)),
+    }
+}
+
 pub fn main() -> Result<()> {
+    // Keep the lock file alive for the duration of the program
+    let _lock_file = match check_for_running_instance() {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("{}", format!("Error: {}", e).bright_red().bold());
+            eprintln!("{}", "Please close any other running instances of Loggy3 before starting a new one.".yellow());
+            std::process::exit(1);
+        }
+    };
+    
     let args: Vec<String> = std::env::args().collect();
     let verbose_mode = args.iter().any(|arg| arg == "--verbose" || arg == "-v");
     let force_update = args.iter().any(|arg| arg == "--force-update" || arg == "-u");
