@@ -216,7 +216,6 @@ impl Session {
     }
 
     fn start_capture_for_display(&mut self, display: DisplayInfo) {
-        // TODO: Not sure that it really listens to the signal.
         let sr_for_thread = Arc::new(AtomicBool::new(true));
         let sr_clone = sr_for_thread.clone();
         let session_dir = self.session_dir.clone();
@@ -257,21 +256,12 @@ fn get_or_create_user_id() -> Result<String> {
     Ok(new_user_id)
 }
 
-fn get_or_prompt_for_email(new_email: Option<String>) -> Result<String> {
+fn get_or_prompt_for_email() -> Result<String> {
     let home_dir = dirs::home_dir().context("Could not determine home directory")?;
     let loggy_dir = home_dir.join(".loggy3");
     create_dir_all(&loggy_dir)?;
     
     let email_path = loggy_dir.join(USER_EMAIL_FILENAME);
-    
-    // If new email is provided via command line, update it
-    if let Some(email) = new_email {
-        if !email.trim().is_empty() {
-            let mut file = File::create(&email_path)?;
-            file.write_all(email.trim().as_bytes())?;
-            return Ok(email.trim().to_string());
-        }
-    }
     
     // If email file exists, read it
     if email_path.exists() {
@@ -285,20 +275,23 @@ fn get_or_prompt_for_email(new_email: Option<String>) -> Result<String> {
         }
     }
     
-    // If we got here, we need to prompt for an email
-    println!("\n{}", "Please enter your email address (or press Enter to skip):".bright_green());
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    
-    let email = input.trim().to_string();
-    
-    // Only save if user provided something
-    if !email.is_empty() {
+    loop {
+        println!("\n{}", "Please enter an email address or username to identify your logs:".bright_green());
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        
+        let email = input.trim().to_string();
+        
+        if email.is_empty() {
+            println!("{}", "Identifier cannot be empty. Please try again.".bright_red());
+            continue;
+        }
+        
         let mut file = File::create(&email_path)?;
         file.write_all(email.as_bytes())?;
+        
+        return Ok(email);
     }
-    
-    Ok(email)
 }
 
 pub fn main() -> Result<()> {
@@ -330,16 +323,11 @@ pub fn main() -> Result<()> {
         }
     }
     
-    // Check for email argument
-    let email_arg = args.iter().position(|arg| arg == "--email" || arg == "-e");
-    let new_email = email_arg.and_then(|pos| args.get(pos + 1).cloned());
-
     println!("{} {}", "\nLoggy3 Screen Recorder".bright_green().bold(), 
               format!("v{}", CURRENT_VERSION).bright_cyan());
     println!("{}", "======================".bright_green());
     println!("{}", "Usage:".bright_yellow());
     println!("{}", "  --verbose, -v       Enable verbose output".bright_black());
-    println!("{}", "  --email, -e EMAIL   Set or change your email address".bright_black());
     println!("");
 
     // Get or create user ID
@@ -356,12 +344,12 @@ pub fn main() -> Result<()> {
         *user_id_guard = user_id.clone();
     }
     
-    // Get or prompt for email
-    let user_email = match get_or_prompt_for_email(new_email) {
+    // Get or prompt for email (now required)
+    let user_email = match get_or_prompt_for_email() {
         Ok(email) => email,
         Err(e) => {
-            eprintln!("Warning: Failed to get/prompt for email: {}", e);
-            "".to_string()
+            eprintln!("Error: Failed to get/prompt for email: {}", e);
+            return Err(anyhow::anyhow!("Email is required to use Loggy3: {}", e));
         }
     };
     
@@ -371,11 +359,7 @@ pub fn main() -> Result<()> {
     }
     
     println!("{} {}", "User ID:".bright_yellow(), user_id.bright_cyan());
-    if !user_email.is_empty() {
-        println!("{} {}", "User Email:".bright_yellow(), user_email.bright_cyan());
-    } else {
-        println!("{} {}", "User Email:".bright_yellow(), "not set (use --email to set)".bright_black());
-    }
+    println!("{} {}", "User Email:".bright_yellow(), user_email.bright_cyan());
     
     if VERBOSE.load(Ordering::SeqCst) {
         println!("{}", "Verbose output enabled".yellow());
