@@ -216,6 +216,7 @@ impl Session {
     }
 
     fn start_capture_for_display(&mut self, display: DisplayInfo) {
+        // TODO: Not sure that it really listens to the signal.
         let sr_for_thread = Arc::new(AtomicBool::new(true));
         let sr_clone = sr_for_thread.clone();
         let session_dir = self.session_dir.clone();
@@ -286,15 +287,8 @@ fn get_or_prompt_for_email(new_email: Option<String>) -> Result<String> {
     
     // If we got here, we need to prompt for an email
     println!("\n{}", "Please enter your email address (or press Enter to skip):".bright_green());
-    
-    // Flush stdout to ensure the prompt is displayed before we wait for input
-    std::io::stdout().flush()?;
-    
-    // Use a more reliable approach for reading input on macOS
     let mut input = String::new();
-    let stdin = std::io::stdin();
-    let mut handle = stdin.lock();
-    handle.read_line(&mut input)?;
+    std::io::stdin().read_line(&mut input)?;
     
     let email = input.trim().to_string();
     
