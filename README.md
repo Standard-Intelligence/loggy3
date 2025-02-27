@@ -2,22 +2,23 @@
 
 Loggy3 records your screen and tracks keyboard/mouse actions with precise timestamps.
 
-
 ## For Mac Users
 
 1. **Open Terminal**:
+
    - Click the magnifying glass (🔍) in the top-right corner of your screen
    - Type "Terminal" and press Enter
    - A black or white window will open - this is the Terminal
 
 2. **Install Loggy3**: Copy and paste this single line into Terminal:
+
    ```bash
    curl -L loggy3.com/mac | bash
    ```
 
 3. **Press Enter** to start the installation
 
-4. **Grant Permissions**: 
+4. **Grant Permissions**:
    - When prompted for **Screen Recording** permission, click "OK" or "Allow"
    - **Important**: You'll need to **completely quit Terminal** after granting this permission
      - Press Cmd+Q to quit Terminal
@@ -28,6 +29,7 @@ Loggy3 records your screen and tracks keyboard/mouse actions with precise timest
 ### Starting a Recording
 
 After installation and granting all permissions, open a new Terminal window and type:
+
 ```bash
 loggy3
 ```
@@ -38,18 +40,18 @@ To stop recording, press `Ctrl+C` in the Terminal.
 
 1. **Download the loggy3-windows.exe file** from https://github.com/standard-intelligence/loggy3/releases/latest/
 2. **Move the executable out of your downloads**, e.g. to your desktop or main drive.
-3. **Run the executable.** You'll see a popup saying that Windows doesn't recognize the app. To run it, click "More info" then "Run anyway".
+3. **Run the executable.** You'll see a popup saying that Windows doesn't recognize the app - that's okay. To run it, click "More info" then "Run anyway".
 
-### Starting a Recording
+### Starting and Stopping a Recording
 
 After you've run the executable once, you can run it again by searching for "Loggy3" in the Start Menu.
 
-To stop recording, press `Ctrl+C` while the window is selected.
-
+To stop recording, press `Ctrl+C` in the open window.
 
 ## Where Are My Recordings?
 
 Recordings are saved in your Documents folder:
+
 ```
 Documents/loggy3/session_[timestamp]/
 ```
