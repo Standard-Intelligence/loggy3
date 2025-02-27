@@ -28,6 +28,7 @@ use sysinfo::System;
 use ureq;
 use lazy_static::lazy_static;
 use uuid::Uuid;
+use indicatif::{ProgressBar, ProgressStyle};
 
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
@@ -297,6 +298,7 @@ fn get_or_prompt_for_email() -> Result<String> {
 pub fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let verbose_mode = args.iter().any(|arg| arg == "--verbose" || arg == "-v");
+    let force_update = args.iter().any(|arg| arg == "--force-update" || arg == "-u");
     
     if verbose_mode {
         VERBOSE.store(true, Ordering::SeqCst);
@@ -328,6 +330,7 @@ pub fn main() -> Result<()> {
     println!("{}", "======================".bright_green());
     println!("{}", "Usage:".bright_yellow());
     println!("{}", "  --verbose, -v       Enable verbose output".bright_black());
+    println!("{}", "  --force-update, -u  Force update to latest version".bright_black());
     println!("");
 
     // Get or create user ID
@@ -367,28 +370,44 @@ pub fn main() -> Result<()> {
     
     println!("{}", "Checking for updates...".cyan());
     
-    if let Some((version, download_url, release_url)) = check_for_updates() {
-        println!("{} {} {} {}", 
-            "A new version".bright_yellow(),
-            version.bright_green().bold(),
-            "is available!".bright_yellow(),
-            format!("(current: {})", CURRENT_VERSION).bright_black()
-        );
+    if let Some((version, download_url, release_url)) = check_for_updates(force_update) {
+        if force_update && version == CURRENT_VERSION {
+            println!("{} {} {} {}", 
+                "Forcing update to version".bright_yellow(),
+                version.bright_green().bold(),
+                "(same as current version)".bright_yellow(),
+                ""
+            );
+        } else {
+            println!("{} {} {} {}", 
+                "A new version".bright_yellow(),
+                version.bright_green().bold(),
+                "is available!".bright_yellow(),
+                format!("(current: {})", CURRENT_VERSION).bright_black()
+            );
+        }
         
         println!("Release page: {}", release_url.bright_blue().underline());
         
-        println!("\nWould you like to update now? [Y/n] ");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        
-        match input.trim().to_lowercase().as_str() {
-            "y" | "yes" | "" => {
-                update_to_new_version(&download_url)?;
-            }
-            _ => {
-                println!("{}", "Update skipped. The application will continue to run.".yellow());
+        if force_update {
+            println!("\nForce update flag is set. Updating automatically...");
+            update_to_new_version(&download_url)?;
+        } else {
+            println!("\nWould you like to update now? [Y/n] ");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            
+            match input.trim().to_lowercase().as_str() {
+                "y" | "yes" | "" => {
+                    update_to_new_version(&download_url)?;
+                }
+                _ => {
+                    println!("{}", "Update skipped. The application will continue to run.".yellow());
+                }
             }
         }
+    } else if force_update {
+        println!("{}", "Force update requested but no update is available.".yellow());
     } else if VERBOSE.load(Ordering::SeqCst) {
         println!("{}", "You're running the latest version!".green());
     }
@@ -1009,6 +1028,7 @@ fn download_ffmpeg() -> Result<PathBuf> {
         Err(e) => return Err(anyhow::anyhow!("Failed to acquire download mutex: {}", e)),
     };
 
+    // Re-check after acquiring the lock in case another thread downloaded it
     if let Ok(ffmpeg_path_guard) = FFMPEG_PATH.lock() {
         if let Some(path) = ffmpeg_path_guard.clone() {
             if path.exists() {
@@ -1024,31 +1044,102 @@ fn download_ffmpeg() -> Result<PathBuf> {
     let ffmpeg_path = loggy_dir.join("ffmpeg");
     
     if !ffmpeg_path.exists() {
-        println!("Downloading ffmpeg binary...");
+        println!("{}", "Downloading ffmpeg binary (required)...".cyan());
         
         let temp_path = loggy_dir.join("ffmpeg.downloading");
         
-        println!("Downloading from {}", platform::FFMPEG_DOWNLOAD_URL);
+        if VERBOSE.load(Ordering::SeqCst) {
+            println!("Downloading from {}", platform::FFMPEG_DOWNLOAD_URL);
+        }
         
-        let response = ureq::get(platform::FFMPEG_DOWNLOAD_URL)
-            .call()
-            .context("Failed to download ffmpeg binary")?;
+        // Get the content length for progress tracking
+        let response = match ureq::get(platform::FFMPEG_DOWNLOAD_URL).call() {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to download ffmpeg binary: {}. Cannot continue without ffmpeg.", e));
+            }
+        };
         
-        let mut file = File::create(&temp_path).context("Failed to create temporary file")?;
-        let mut buffer = Vec::new();
-        response.into_reader().read_to_end(&mut buffer).context("Failed to read response")?;
-        file.write_all(&buffer).context("Failed to write to temporary file")?;
+        let content_length = response
+            .header("Content-Length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        
+        // Create progress bar
+        let pb = if content_length > 0 {
+            let pb = ProgressBar::new(content_length);
+            pb.set_style(ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"));
+            pb
+        } else {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(ProgressStyle::default_spinner()
+                .template("{spinner:.green} [{elapsed_precise}] {bytes} downloaded")
+                .unwrap());
+            pb
+        };
+        
+        let mut file = match File::create(&temp_path) {
+            Ok(file) => file,
+            Err(e) => {
+                pb.finish_with_message("Download failed");
+                return Err(anyhow::anyhow!("Failed to create temporary file: {}. Cannot continue without ffmpeg.", e));
+            }
+        };
+        
+        let mut reader = response.into_reader();
+        let mut buffer = [0; 8192];
+        let mut downloaded = 0;
+        
+        while let Ok(n) = reader.read(&mut buffer) {
+            if n == 0 { break }
             
-        std::fs::rename(&temp_path, &ffmpeg_path)?;
-        println!("Download complete");
+            if let Err(e) = file.write_all(&buffer[..n]) {
+                pb.finish_with_message("Download failed");
+                return Err(anyhow::anyhow!("Failed to write to temporary file: {}. Cannot continue without ffmpeg.", e));
+            }
+            
+            downloaded += n as u64;
+            pb.set_position(downloaded);
+        }
+        
+        // Flush and close the file
+        if let Err(e) = file.flush() {
+            pb.finish_with_message("Download failed");
+            return Err(anyhow::anyhow!("Failed to flush file: {}. Cannot continue without ffmpeg.", e));
+        }
+        
+        // Make sure we drop the file handle before renaming
+        drop(file);
+        
+        pb.finish_with_message("Download complete");
+            
+        // Rename the temporary file to the final path
+        if let Err(e) = std::fs::rename(&temp_path, &ffmpeg_path) {
+            return Err(anyhow::anyhow!("Failed to rename temporary file: {}. Cannot continue without ffmpeg.", e));
+        }
         
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&ffmpeg_path)?.permissions();
+            let mut perms = match std::fs::metadata(&ffmpeg_path) {
+                Ok(meta) => meta.permissions(),
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to get file permissions: {}. Cannot continue without ffmpeg.", e));
+                }
+            };
             perms.set_mode(0o755);
-            std::fs::set_permissions(&ffmpeg_path, perms)?;
+            if let Err(e) = std::fs::set_permissions(&ffmpeg_path, perms) {
+                return Err(anyhow::anyhow!("Failed to set file permissions: {}. Cannot continue without ffmpeg.", e));
+            }
         }
+    }
+    
+    // Verify the file exists and is executable
+    if !ffmpeg_path.exists() {
+        return Err(anyhow::anyhow!("FFmpeg binary does not exist after download. Cannot continue."));
     }
     
     // Update the global cache with the path
@@ -1059,7 +1150,7 @@ fn download_ffmpeg() -> Result<PathBuf> {
     Ok(ffmpeg_path)
 }
 
-fn check_for_updates() -> Option<(String, String, String)> {
+fn check_for_updates(force_update: bool) -> Option<(String, String, String)> {
     let api_url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
     
     // Determine which binary we need for this platform
@@ -1086,7 +1177,8 @@ fn check_for_updates() -> Option<(String, String, String)> {
             if let Ok(release) = response.into_json::<GitHubRelease>() {
                 let latest_version = release.tag_name.trim_start_matches('v').to_string();
                 
-                if is_newer_version(&latest_version, CURRENT_VERSION) {
+                // If force update is enabled or we have a newer version
+                if force_update || is_newer_version(&latest_version, CURRENT_VERSION) {
                     // Find the correct asset for the current platform
                     if let Some(asset) = release.assets.iter().find(|a| a.name == target_asset_name) {
                         return Some((latest_version, asset.browser_download_url.clone(), release.html_url));
@@ -1098,6 +1190,8 @@ fn check_for_updates() -> Option<(String, String, String)> {
                             }
                         }
                     }
+                } else if VERBOSE.load(Ordering::SeqCst) {
+                    println!("{}", "You're running the latest version!".green());
                 }
             }
         }
@@ -1141,27 +1235,95 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
     let target_path = std::env::current_exe().context("Failed to get current executable path")?;
     let temp_path = target_path.with_extension("new");
     
-    println!("Downloading from {}", download_url);
-    let response = ureq::get(download_url)
-        .call()
-        .context("Failed to download update")?;
+    if VERBOSE.load(Ordering::SeqCst) {
+        println!("Downloading from {}", download_url);
+    }
     
-    let mut file = File::create(&temp_path).context("Failed to create temporary file")?;
-    let mut buffer = Vec::new();
-    response.into_reader().read_to_end(&mut buffer).context("Failed to read response")?;
-    file.write_all(&buffer).context("Failed to write to temporary file")?;
+    // Get the content length for progress tracking
+    let response = match ureq::get(download_url).call() {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to download update: {}", e));
+        }
+    };
+    
+    let content_length = response
+        .header("Content-Length")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    
+    // Create progress bar
+    let pb = if content_length > 0 {
+        let pb = ProgressBar::new(content_length);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("#>-"));
+        pb
+    } else {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed_precise}] {bytes} downloaded")
+            .unwrap());
+        pb
+    };
+    
+    let mut file = match File::create(&temp_path) {
+        Ok(file) => file,
+        Err(e) => {
+            pb.finish_with_message("Download failed");
+            return Err(anyhow::anyhow!("Failed to create temporary file: {}", e));
+        }
+    };
+    
+    let mut reader = response.into_reader();
+    let mut buffer = [0; 8192];
+    let mut downloaded = 0;
+    
+    while let Ok(n) = reader.read(&mut buffer) {
+        if n == 0 { break }
+        
+        if let Err(e) = file.write_all(&buffer[..n]) {
+            pb.finish_with_message("Download failed");
+            return Err(anyhow::anyhow!("Failed to write to temporary file: {}", e));
+        }
+        
+        downloaded += n as u64;
+        pb.set_position(downloaded);
+    }
+    
+    // Flush and close the file
+    if let Err(e) = file.flush() {
+        pb.finish_with_message("Download failed");
+        return Err(anyhow::anyhow!("Failed to flush file: {}", e));
+    }
+    
+    // Make sure we drop the file handle before renaming
+    drop(file);
+    
+    pb.finish_with_message("Download complete");
     
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&temp_path)?.permissions();
+        let mut perms = match std::fs::metadata(&temp_path) {
+            Ok(meta) => meta.permissions(),
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to get file permissions: {}", e));
+            }
+        };
         perms.set_mode(0o755);
-        std::fs::set_permissions(&temp_path, perms)?;
+        if let Err(e) = std::fs::set_permissions(&temp_path, perms) {
+            return Err(anyhow::anyhow!("Failed to set file permissions: {}", e));
+        }
     }
     
     println!("{}", format!("Installing update to {}...", target_path.display()).cyan());
     
-    std::fs::rename(&temp_path, &target_path)?;
+    if let Err(e) = std::fs::rename(&temp_path, &target_path) {
+        return Err(anyhow::anyhow!("Failed to install update: {}", e));
+    }
+    
     println!("{}", "✓ Update installed successfully!".green());
     println!("{}", "Please restart loggy3 to use the new version.".bright_green().bold());
     exit(0);
