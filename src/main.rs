@@ -94,9 +94,9 @@ impl Session {
             return Ok(None);
         }
 
-        let home_dir = dirs::document_dir().context("Could not determine documents directory")?;
+        let documents_dir = dirs::document_dir().context("Could not determine documents directory")?;
         let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-        let session_dir = home_dir.join("loggy3").join(format!("session_{}", timestamp));
+        let session_dir = documents_dir.join("loggy3").join(format!("session_{}", timestamp));
         create_dir_all(&session_dir)?;
 
         println!("\n{}", "=== Starting new recording session ===".cyan().bold());
