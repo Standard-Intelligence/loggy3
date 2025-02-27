@@ -1,79 +1,79 @@
 name: Rust
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
     tags:
-      - "v*"
+    - "v*"
   pull_request:
-    branches: ["main"]
+    branches: [ "main" ]
 env:
   CARGO_TERM_COLOR: always
 jobs:
   build-macos-arm:
     runs-on: macos-latest-xlarge
     steps:
-      - uses: actions/checkout@v4
-      - name: Build
-        run: |
-          mkdir -p resources
-          curl -L https://publicr2.standardinternal.com/ffmpeg_binaries/macos/ffmpeg -o resources/ffmpeg
-          cargo build --target aarch64-apple-darwin --verbose --release
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: loggy3-macos-arm64
-          path: target/aarch64-apple-darwin/release/loggy3
+    - uses: actions/checkout@v4
+    - name: Build
+      run: |
+        mkdir -p resources
+        curl -L https://publicr2.standardinternal.com/ffmpeg_binaries/macos/ffmpeg -o resources/ffmpeg
+        cargo build --target aarch64-apple-darwin --verbose --release
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: loggy3-macos-arm64
+        path: target/aarch64-apple-darwin/release/loggy3
 
   build-windows:
     runs-on: windows-latest-16-cores
     steps:
-      - uses: actions/checkout@v4
-      - name: Build
-        run: |
-          mkdir -p resources
-          curl -L https://publicr2.standardinternal.com/ffmpeg_binaries/windows_x64/ffmpeg.exe -o resources/ffmpeg.exe
-          cargo build --verbose --release --jobs 16
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: loggy3-windows
-          path: target/release/loggy3.exe
+    - uses: actions/checkout@v4
+    - name: Build
+      run: |
+        mkdir -p resources
+        curl -L https://publicr2.standardinternal.com/ffmpeg_binaries/windows_x64/ffmpeg.exe -o resources/ffmpeg.exe
+        cargo build --verbose --release --jobs 16
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: loggy3-windows
+        path: target/release/loggy3.exe
 
   release:
-    needs: [build-macos-arm, build-windows]
+    needs: [ build-macos-arm, build-windows ]
     permissions:
       contents: write
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Download macOS ARM build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: loggy3-macos-arm64
-          path: ./
-      - name: Download Windows build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: loggy3-windows
-          path: ./
-      - name: Rename artifacts for release
-        run: |
-          mv ./loggy3 ./loggy3-macos-arm64
-          mv ./loggy3.exe ./loggy3-windows.exe
-      - name: Make binaries executable
-        run: |
-          chmod +x ./loggy3-macos-arm64
-          chmod +x ./mac-install.sh
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            ./loggy3-macos-arm64
-            ./loggy3-windows.exe
-            ./mac-install.sh
-          name: Release ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
+    - uses: actions/checkout@v4
+    - name: Download macOS ARM build artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: loggy3-macos-arm64
+        path: ./
+    - name: Download Windows build artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: loggy3-windows
+        path: ./
+    - name: Rename artifacts for release
+      run: |
+        mv ./loggy3 ./loggy3-macos-arm64
+        mv ./loggy3.exe ./loggy3-windows.exe
+    - name: Make binaries executable
+      run: |
+        chmod +x ./loggy3-macos-arm64
+        chmod +x ./mac-install.sh
+    - name: Create Release
+      id: create_release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          ./loggy3-macos-arm64
+          ./loggy3-windows.exe
+          ./mac-install.sh
+        name: Release ${{ github.ref_name }}
+        draft: false
+        prerelease: false
+        generate_release_notes: true
