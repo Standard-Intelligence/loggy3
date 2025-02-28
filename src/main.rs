@@ -1371,11 +1371,6 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
                     .args(&["/c", "start", "/min", "", batch_path.to_string_lossy().as_ref()])
                     .spawn() {
                     Ok(_) => {
-                        println!("{}", "✓ Update script created and started".green());
-                        println!("{}", "The update will be applied when you close Loggy3.".bright_green().bold());
-                        println!("{}", "Please close the application to complete the update.".bright_yellow());
-                        
-                        // Wait for user to press Enter to exit
                         println!("\n{}", "Press Enter to exit and apply the update...".bright_cyan());
                         let mut input = String::new();
                         if let Err(e) = std::io::stdin().read_line(&mut input) {
