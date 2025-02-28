@@ -19,7 +19,7 @@ pub use mac::{get_display_info, unified_event_listener_thread_with_cache, check_
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, set_path_or_start_menu_shortcut, get_windows_version_type, check_windows_version_compatibility, WindowsVersionType, WindowsVersion, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT, FFMPEG_FILENAME, FFMPEG_DOWNLOAD_URL};
+pub use windows::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, set_path_or_start_menu_shortcut, get_windows_version_type, check_windows_version_compatibility, WindowsVersionType, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT, FFMPEG_FILENAME, FFMPEG_DOWNLOAD_URL};
 
 static EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

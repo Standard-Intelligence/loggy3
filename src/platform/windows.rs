@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,7 +30,6 @@ use winapi::um::winuser::{
     WS_DISABLED, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
-use windows_capture;
 use scap::Target;
 
 use crate::DisplayInfo;
@@ -198,7 +196,6 @@ fn log_key_event_cached(event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCach
         let multi_timestamp = get_multi_timestamp();
 
         let key_str = format!("VK_{}", key_code);
-        let is_press = action == "press";
         
         let raw_line = format!("'{}', '{}'", action, key_str);
         
