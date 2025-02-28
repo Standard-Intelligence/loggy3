@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs::{create_dir_all, File};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use colored::*;
 use anyhow::Result;
@@ -49,7 +49,7 @@ pub fn get_multi_timestamp() -> MultiTimestamp {
 
 pub struct LogWriterCache {
     session_dir: PathBuf,
-    event_writers: HashMap<(usize, String), Arc<Mutex<BufWriter<File>>>>,
+    event_writers: HashMap<(usize, String), File>,
 }
 
 impl LogWriterCache {
@@ -60,7 +60,7 @@ impl LogWriterCache {
         }
     }
 
-    fn get_writer(&mut self, timestamp_ms: u128, log_type: &str) -> Result<Arc<Mutex<BufWriter<File>>>> {
+    fn get_writer(&mut self, timestamp_ms: u128, log_type: &str) -> Result<&mut File> {
         let chunk_index = (timestamp_ms / 60000) as usize;
         let cache_key = (chunk_index, log_type.to_string());
         
@@ -69,11 +69,11 @@ impl LogWriterCache {
             create_dir_all(&chunk_dir)?;
             
             let log_path = chunk_dir.join(format!("{}.log", log_type));
-            let writer = Arc::new(Mutex::new(BufWriter::new(File::create(log_path)?)));
+            let writer = File::create(log_path)?;
             println!("{}", format!("Created new {} log for chunk {}", log_type, chunk_index).yellow());
             self.event_writers.insert(cache_key.clone(), writer);
         }
-        Ok(self.event_writers.get(&cache_key).unwrap().clone())
+        Ok(self.event_writers.get_mut(&cache_key).unwrap())
     }
 }
 
@@ -99,10 +99,13 @@ pub fn handle_event_with_cache(
     
     if let Ok(mut cache_lock) = cache.lock() {
         if let Ok(raw_writer) = cache_lock.get_writer(multi_timestamp.wall_time, log_type) {
-            if let Ok(mut raw_writer_lock) = raw_writer.lock() {
-                let _ = raw_writer_lock.write_all(raw_line.as_bytes());
-                let _ = raw_writer_lock.flush();
+            if let Err(e) = raw_writer.write_all(raw_line.as_bytes()) {
+                eprintln!("Warning: Failed to write to {} log: {}", log_type, e);
             }
+        } else {
+            eprintln!("Warning: Failed to get writer for {} log", log_type);
         }
+    } else {
+        eprintln!("Warning: Failed to acquire lock on log writer cache");
     }
 }

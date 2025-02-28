@@ -323,7 +323,7 @@ pub fn unified_event_listener_thread_with_cache(
                             "{{\"type\": \"key_down\", {}, \"keycode\": {}, \"keycodeStr\": \"{}\", \"isAutorepeat\": {}, \"keyboardType\": {}}}",
                             common_fields, keycode, keycode_to_string(keycode as CGKeyCode), is_autorepeat, keyboard_type
                         );
-                        handle_event_with_cache(&multi_timestamp, json, "keyboard", &writer_cache);
+                        handle_event_with_cache(&multi_timestamp, json, "keypresses", &writer_cache);
                     },
                     
                     CGEventType::KeyUp => {
@@ -334,7 +334,7 @@ pub fn unified_event_listener_thread_with_cache(
                             "{{\"type\": \"key_up\", {}, \"keycode\": {}, \"keycodeStr\": \"{}\", \"keyboardType\": {}}}",
                             common_fields, keycode, keycode_to_string(keycode as CGKeyCode), keyboard_type
                         );
-                        handle_event_with_cache(&multi_timestamp, json, "keyboard", &writer_cache);
+                        handle_event_with_cache(&multi_timestamp, json, "keypresses", &writer_cache);
                     },
                     
                     CGEventType::FlagsChanged => {
@@ -346,7 +346,7 @@ pub fn unified_event_listener_thread_with_cache(
                             "{{\"type\": \"flags_changed\", {}, \"flagChanges\": {}}}",
                             common_fields, flag_changes
                         );
-                        handle_event_with_cache(&multi_timestamp, json, "keyboard", &writer_cache);
+                        handle_event_with_cache(&multi_timestamp, json, "keypresses", &writer_cache);
                     },
                     
                     // Scroll wheel events
