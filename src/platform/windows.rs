@@ -176,9 +176,6 @@ fn to_wstring(str: &str) -> Vec<u16> {
 lazy_static! {
     static ref WRITER_CACHE: Mutex<Option<Arc<Mutex<LogWriterCache>>>> = Mutex::new(None);
     static ref SHOULD_RUN: AtomicBool = AtomicBool::new(true);
-
-    // The new lazy_static for tracking pressed keys:
-    static ref PRESSED_KEYS: Mutex<Option<Arc<Mutex<Vec<String>>>>> = Mutex::new(None);
 }
 
 /// Log a mouse event using the writer cache
@@ -193,10 +190,10 @@ fn log_mouse_event_cached(multi_timestamp: &MultiTimestamp, event: &RawEvent, wr
     // Convert the event to a JSON string and add sequence number
     if let Ok(json_string) = serde_json::to_string(event) {
         handle_event_with_cache(multi_timestamp, json_string, "mouse", writer_cache);
-    }
+    }   
 }
 
-fn log_key_event_cached(event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCache>>, pressed_keys: &Arc<Mutex<Vec<String>>>) {
+fn log_key_event_cached(event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCache>>) {
     if let RawEvent::Key { action, key_code, timestamp: _ } = event {
         let multi_timestamp = get_multi_timestamp();
 
@@ -213,34 +210,7 @@ fn log_key_event_cached(event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCach
         //         }
         //     }
         // }
-        handle_event_with_cache(&multi_timestamp, raw_line, "raw_keypresses", writer_cache);
-        
-        // Continue with the existing state-tracking logic
-        let mut keys = pressed_keys.lock().unwrap();
-        
-        if is_press {
-            if !keys.contains(&key_str) {
-                keys.push(key_str.clone());
-            }
-        } else {
-            keys.retain(|k| k != &key_str);
-        }
-        
-        let state = if keys.is_empty() {
-            "none".to_string()
-        } else {
-            format!("+{}", keys.join("+"))
-        };
-        
-        // if let Ok(mut cache_lock) = writer_cache.lock() {
-        //     if let Ok(writer) = cache_lock.get_keypress_writer(wall_time) {
-        //         if let Ok(mut writer_lock) = writer.lock() {
-        //             let _ = writeln!(writer_lock, "{}", line);
-        //             let _ = writer_lock.flush();
-        //         }
-        //     }
-        // }
-        handle_event_with_cache(&multi_timestamp, state, "keypresses", writer_cache);
+        handle_event_with_cache(&multi_timestamp, raw_line, "keypresses", writer_cache);
     }
 }
 
@@ -250,7 +220,6 @@ fn handle_key_event_cached(
     vkey: u32,
     timestamp: u128,
     writer_cache: &Arc<Mutex<LogWriterCache>>,
-    pressed_keys: &Arc<Mutex<Vec<String>>>,
 ) {
     let event = RawEvent::Key {
         action: if pressed {
@@ -262,13 +231,12 @@ fn handle_key_event_cached(
         timestamp,
     };
 
-    log_key_event_cached(&event, writer_cache, pressed_keys);
+    log_key_event_cached(&event, writer_cache);
 }
 
 unsafe fn handle_raw_input_with_cache(
     lparam: LPARAM,
     writer_cache: &Arc<Mutex<LogWriterCache>>,
-    pressed_keys: &Arc<Mutex<Vec<String>>>,
 ) {
     let mut raw: RAWINPUT = mem::zeroed();
     let mut size = mem::size_of::<RAWINPUT>() as u32;
@@ -374,7 +342,7 @@ unsafe fn handle_raw_input_with_cache(
             // typical: 0 => press, 1 => release
             let pressed = (kb.Flags & 0x01) == 0;
 
-            handle_key_event_cached(pressed, kb.VKey as u32, timestamp, writer_cache, pressed_keys);
+            handle_key_event_cached(pressed, kb.VKey as u32, timestamp, writer_cache);
         }
         _ => {}
     }
@@ -389,11 +357,10 @@ unsafe extern "system" fn window_proc(
     match msg {
         WM_INPUT => {
             let wc = WRITER_CACHE.lock().unwrap();
-            let pk = PRESSED_KEYS.lock().unwrap();
 
-            if let (Some(writer_cache), Some(keys)) = (&*wc, &*pk) {
+            if let Some(writer_cache) = &*wc {
                 if SHOULD_RUN.load(Ordering::SeqCst) {
-                    handle_raw_input_with_cache(lparam, writer_cache, keys);
+                    handle_raw_input_with_cache(lparam, writer_cache);
                 }
             }
             0
@@ -482,11 +449,9 @@ fn register_raw_input(hwnd: HWND) -> bool {
 }
 
 /// The Windows version of unified_event_listener_thread using Raw Input with cache support.
-/// This includes pressed_keys handling, like on macOS.
 pub fn unified_event_listener_thread_with_cache(
     should_run: Arc<AtomicBool>,
     writer_cache: Arc<Mutex<LogWriterCache>>,
-    pressed_keys: Arc<Mutex<Vec<String>>>,
 ) {
     println!("{}", "Starting input event logging with automatic chunk rotation...".green());
     
@@ -494,9 +459,6 @@ pub fn unified_event_listener_thread_with_cache(
     {
         let mut wc = WRITER_CACHE.lock().unwrap();
         *wc = Some(writer_cache.clone());
-
-        let mut pk = PRESSED_KEYS.lock().unwrap();
-        *pk = Some(pressed_keys.clone());
 
         SHOULD_RUN.store(true, Ordering::SeqCst);
     }
