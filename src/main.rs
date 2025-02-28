@@ -1374,7 +1374,15 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
                         println!("{}", "✓ Update script created and started".green());
                         println!("{}", "The update will be applied when you close Loggy3.".bright_green().bold());
                         println!("{}", "Please close the application to complete the update.".bright_yellow());
-                        return Ok(());
+                        
+                        // Wait for user to press Enter to exit
+                        println!("\n{}", "Press Enter to exit and apply the update...".bright_cyan());
+                        let mut input = String::new();
+                        if let Err(e) = std::io::stdin().read_line(&mut input) {
+                            eprintln!("Error reading input: {}", e);
+                        }
+                        println!("{}", "Exiting to apply update...".bright_green());
+                        exit(0);
                     },
                     Err(e) => {
                         return Err(anyhow::anyhow!("Failed to start update script: {}", e));
