@@ -1005,6 +1005,64 @@ fn download_ffmpeg() -> Result<PathBuf> {
     
     let ffmpeg_path = loggy_dir.join(platform::FFMPEG_FILENAME);
     
+    // Check if ffmpeg exists but might not have executable permissions
+    if ffmpeg_path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            
+            // Check if the file is executable
+            let is_executable = match std::fs::metadata(&ffmpeg_path) {
+                Ok(meta) => {
+                    let perms = meta.permissions();
+                    let mode = perms.mode();
+                    // Check if any execute bit is set
+                    (mode & 0o111) != 0
+                },
+                Err(_) => false,
+            };
+            
+            // If not executable, try to fix it
+            if !is_executable {
+                println!("{}", "Found existing FFmpeg binary without executable permissions. Fixing...".yellow());
+                
+                // Try chmod first
+                if let Err(e) = std::process::Command::new("chmod")
+                    .arg("+x")
+                    .arg(&ffmpeg_path)
+                    .status() {
+                        eprintln!("Warning: Failed to set executable permissions with chmod: {}", e);
+                        
+                        // Fallback to Rust's permission system
+                        match std::fs::metadata(&ffmpeg_path) {
+                            Ok(meta) => {
+                                let mut perms = meta.permissions();
+                                perms.set_mode(0o755); // rwxr-xr-x
+                                if let Err(e) = std::fs::set_permissions(&ffmpeg_path, perms) {
+                                    eprintln!("Warning: Failed to set file permissions: {}", e);
+                                    // If we can't fix it, redownload
+                                    println!("{}", "Could not fix permissions. Will redownload FFmpeg...".yellow());
+                                    if let Err(e) = std::fs::remove_file(&ffmpeg_path) {
+                                        eprintln!("Warning: Failed to remove existing FFmpeg binary: {}", e);
+                                    }
+                                } else {
+                                    println!("{}", "✓ Fixed permissions on existing FFmpeg binary".green());
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("Warning: Failed to get file metadata: {}", e);
+                                // If we can't access metadata, redownload
+                                println!("{}", "Could not access file metadata. Will redownload FFmpeg...".yellow());
+                                if let Err(e) = std::fs::remove_file(&ffmpeg_path) {
+                                    eprintln!("Warning: Failed to remove existing FFmpeg binary: {}", e);
+                                }
+                            }
+                        }
+                }
+            }
+        }
+    }
+    
     if !ffmpeg_path.exists() {
         println!("{}", "Downloading ffmpeg binary (required)...".cyan());
         
@@ -1074,8 +1132,62 @@ fn download_ffmpeg() -> Result<PathBuf> {
         
         pb.finish_with_message("Download complete");
         
+        // Set executable permissions on Unix systems (macOS, Linux)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            
+            // First set permissions on the temp file
+            if let Err(e) = std::process::Command::new("chmod")
+                .arg("+x")
+                .arg(&temp_path)
+                .status() {
+                    eprintln!("Warning: Failed to set executable permissions with chmod: {}", e);
+                    
+                    // Fallback to Rust's permission system
+                    let mut perms = match std::fs::metadata(&temp_path) {
+                        Ok(meta) => meta.permissions(),
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("Failed to get file permissions: {}. Cannot continue without ffmpeg.", e));
+                        }
+                    };
+                    perms.set_mode(0o755); // rwxr-xr-x
+                    if let Err(e) = std::fs::set_permissions(&temp_path, perms) {
+                        return Err(anyhow::anyhow!("Failed to set file permissions: {}. Cannot continue without ffmpeg.", e));
+                    }
+            }
+            
+            println!("{}", "✓ Set executable permissions on ffmpeg".green());
+        }
+        
         if let Err(e) = std::fs::rename(&temp_path, &ffmpeg_path) {
             return Err(anyhow::anyhow!("Failed to rename temporary file: {}. Cannot continue without ffmpeg.", e));
+        }
+        
+        // Double-check permissions after rename on Unix systems
+        #[cfg(unix)]
+        {
+            if let Err(e) = std::process::Command::new("chmod")
+                .arg("+x")
+                .arg(&ffmpeg_path)
+                .status() {
+                    eprintln!("Warning: Failed to set executable permissions after rename: {}", e);
+                    
+                    // Fallback to Rust's permission system
+                    use std::os::unix::fs::PermissionsExt;
+                    match std::fs::metadata(&ffmpeg_path) {
+                        Ok(meta) => {
+                            let mut perms = meta.permissions();
+                            perms.set_mode(0o755); // rwxr-xr-x
+                            if let Err(e) = std::fs::set_permissions(&ffmpeg_path, perms) {
+                                eprintln!("Warning: Failed to set file permissions after rename: {}", e);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Warning: Failed to get file permissions after rename: {}", e);
+                        }
+                    };
+            }
         }
     }
     
@@ -1239,22 +1351,60 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = match std::fs::metadata(&temp_path) {
-            Ok(meta) => meta.permissions(),
-            Err(e) => {
-                return Err(anyhow::anyhow!("Failed to get file permissions: {}", e));
-            }
-        };
-        perms.set_mode(0o755);
-        if let Err(e) = std::fs::set_permissions(&temp_path, perms) {
-            return Err(anyhow::anyhow!("Failed to set file permissions: {}", e));
+        
+        // Try chmod first (more reliable on macOS)
+        if let Err(e) = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&temp_path)
+            .status() {
+                eprintln!("Warning: Failed to set executable permissions with chmod: {}", e);
+                
+                // Fallback to Rust's permission system
+                let mut perms = match std::fs::metadata(&temp_path) {
+                    Ok(meta) => meta.permissions(),
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to get file permissions: {}", e));
+                    }
+                };
+                perms.set_mode(0o755); // rwxr-xr-x
+                if let Err(e) = std::fs::set_permissions(&temp_path, perms) {
+                    return Err(anyhow::anyhow!("Failed to set file permissions: {}", e));
+                }
         }
+        
+        println!("{}", "✓ Set executable permissions on update".green());
     }
     
     println!("{}", format!("Installing update to {}...", target_path.display()).cyan());
     
     if let Err(e) = std::fs::rename(&temp_path, &target_path) {
         return Err(anyhow::anyhow!("Failed to install update: {}", e));
+    }
+    
+    // Double-check permissions after rename on Unix systems
+    #[cfg(unix)]
+    {
+        if let Err(e) = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&target_path)
+            .status() {
+                eprintln!("Warning: Failed to set executable permissions after rename: {}", e);
+                
+                // Fallback to Rust's permission system
+                use std::os::unix::fs::PermissionsExt;
+                match std::fs::metadata(&target_path) {
+                    Ok(meta) => {
+                        let mut perms = meta.permissions();
+                        perms.set_mode(0o755); // rwxr-xr-x
+                        if let Err(e) = std::fs::set_permissions(&target_path, perms) {
+                            eprintln!("Warning: Failed to set file permissions after rename: {}", e);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Warning: Failed to get file permissions after rename: {}", e);
+                    }
+                };
+        }
     }
     
     println!("{}", "✓ Update installed successfully!".green());
