@@ -1011,53 +1011,23 @@ fn download_ffmpeg() -> Result<PathBuf> {
         {
             use std::os::unix::fs::PermissionsExt;
             
-            // Check if the file is executable
             let is_executable = match std::fs::metadata(&ffmpeg_path) {
                 Ok(meta) => {
                     let perms = meta.permissions();
                     let mode = perms.mode();
-                    // Check if any execute bit is set
                     (mode & 0o111) != 0
                 },
                 Err(_) => false,
             };
             
-            // If not executable, try to fix it
             if !is_executable {
                 println!("{}", "Found existing FFmpeg binary without executable permissions. Fixing...".yellow());
                 
-                // Try chmod first
                 if let Err(e) = std::process::Command::new("chmod")
                     .arg("+x")
                     .arg(&ffmpeg_path)
                     .status() {
                         eprintln!("Warning: Failed to set executable permissions with chmod: {}", e);
-                        
-                        // Fallback to Rust's permission system
-                        match std::fs::metadata(&ffmpeg_path) {
-                            Ok(meta) => {
-                                let mut perms = meta.permissions();
-                                perms.set_mode(0o755); // rwxr-xr-x
-                                if let Err(e) = std::fs::set_permissions(&ffmpeg_path, perms) {
-                                    eprintln!("Warning: Failed to set file permissions: {}", e);
-                                    // If we can't fix it, redownload
-                                    println!("{}", "Could not fix permissions. Will redownload FFmpeg...".yellow());
-                                    if let Err(e) = std::fs::remove_file(&ffmpeg_path) {
-                                        eprintln!("Warning: Failed to remove existing FFmpeg binary: {}", e);
-                                    }
-                                } else {
-                                    println!("{}", "✓ Fixed permissions on existing FFmpeg binary".green());
-                                }
-                            },
-                            Err(e) => {
-                                eprintln!("Warning: Failed to get file metadata: {}", e);
-                                // If we can't access metadata, redownload
-                                println!("{}", "Could not access file metadata. Will redownload FFmpeg...".yellow());
-                                if let Err(e) = std::fs::remove_file(&ffmpeg_path) {
-                                    eprintln!("Warning: Failed to remove existing FFmpeg binary: {}", e);
-                                }
-                            }
-                        }
                 }
             }
         }
@@ -1132,26 +1102,23 @@ fn download_ffmpeg() -> Result<PathBuf> {
         
         pb.finish_with_message("Download complete");
         
-        // Set executable permissions on Unix systems (macOS, Linux)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             
-            // First set permissions on the temp file
             if let Err(e) = std::process::Command::new("chmod")
                 .arg("+x")
                 .arg(&temp_path)
                 .status() {
                     eprintln!("Warning: Failed to set executable permissions with chmod: {}", e);
                     
-                    // Fallback to Rust's permission system
                     let mut perms = match std::fs::metadata(&temp_path) {
                         Ok(meta) => meta.permissions(),
                         Err(e) => {
                             return Err(anyhow::anyhow!("Failed to get file permissions: {}. Cannot continue without ffmpeg.", e));
                         }
                     };
-                    perms.set_mode(0o755); // rwxr-xr-x
+                    perms.set_mode(0o755);
                     if let Err(e) = std::fs::set_permissions(&temp_path, perms) {
                         return Err(anyhow::anyhow!("Failed to set file permissions: {}. Cannot continue without ffmpeg.", e));
                     }
@@ -1164,7 +1131,6 @@ fn download_ffmpeg() -> Result<PathBuf> {
             return Err(anyhow::anyhow!("Failed to rename temporary file: {}. Cannot continue without ffmpeg.", e));
         }
         
-        // Double-check permissions after rename on Unix systems
         #[cfg(unix)]
         {
             if let Err(e) = std::process::Command::new("chmod")
@@ -1172,21 +1138,6 @@ fn download_ffmpeg() -> Result<PathBuf> {
                 .arg(&ffmpeg_path)
                 .status() {
                     eprintln!("Warning: Failed to set executable permissions after rename: {}", e);
-                    
-                    // Fallback to Rust's permission system
-                    use std::os::unix::fs::PermissionsExt;
-                    match std::fs::metadata(&ffmpeg_path) {
-                        Ok(meta) => {
-                            let mut perms = meta.permissions();
-                            perms.set_mode(0o755); // rwxr-xr-x
-                            if let Err(e) = std::fs::set_permissions(&ffmpeg_path, perms) {
-                                eprintln!("Warning: Failed to set file permissions after rename: {}", e);
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("Warning: Failed to get file permissions after rename: {}", e);
-                        }
-                    };
             }
         }
     }
@@ -1377,6 +1328,68 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
     
     println!("{}", format!("Installing update to {}...", target_path.display()).cyan());
     
+    #[cfg(windows)]
+    {
+        // On Windows, we can't replace a running executable
+        // Create a batch script to replace the file after the application exits
+        let batch_path = target_path.with_extension("bat");
+        let pid = std::process::id();
+        
+        // Create batch script content
+        // The script will:
+        // 1. Wait for the current process to exit
+        // 2. Try to copy the new executable over the old one
+        // 3. Delete the temporary files
+        // 4. Start the new executable
+        let batch_content = format!(
+            "@echo off\n\
+             :wait\n\
+             timeout /t 1 /nobreak > nul\n\
+             tasklist | find \"{} {}\" > nul\n\
+             if not errorlevel 1 goto wait\n\
+             echo Updating Loggy3...\n\
+             :copy\n\
+             copy /y \"{}\" \"{}\" > nul\n\
+             if errorlevel 1 (\n\
+             timeout /t 1 /nobreak > nul\n\
+             goto copy\n\
+             )\n\
+             echo Update complete!\n\
+             del \"{}\" > nul\n\
+             del \"%~f0\" > nul\n\
+             start \"\" \"{}\"",
+            "loggy3.exe", pid,
+            temp_path.to_string_lossy(), target_path.to_string_lossy(),
+            temp_path.to_string_lossy(), target_path.to_string_lossy()
+        );
+        
+        // Write the batch script
+        match std::fs::write(&batch_path, batch_content) {
+            Ok(_) => {
+                // Execute the batch script
+                match std::process::Command::new("cmd")
+                    .args(&["/c", "start", "/min", "", batch_path.to_string_lossy().as_ref()])
+                    .spawn() {
+                    Ok(_) => {
+                        println!("{}", "✓ Update script created and started".green());
+                        println!("{}", "The update will be applied when you close Loggy3.".bright_green().bold());
+                        println!("{}", "Please close the application to complete the update.".bright_yellow());
+                    },
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to start update script: {}", e));
+                    }
+                }
+            },
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to create update script: {}", e));
+            }
+        }
+        
+        // Don't exit immediately on Windows, let the user close the app manually
+        return Ok(());
+    }
+    
+    #[cfg(not(windows))]
     if let Err(e) = std::fs::rename(&temp_path, &target_path) {
         return Err(anyhow::anyhow!("Failed to install update: {}", e));
     }
@@ -1407,9 +1420,14 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
         }
     }
     
-    println!("{}", "✓ Update installed successfully!".green());
-    println!("{}", "Please restart loggy3 to use the new version.".bright_green().bold());
-    exit(0);
+    #[cfg(not(windows))]
+    {
+        println!("{}", "✓ Update installed successfully!".green());
+        println!("{}", "Please restart loggy3 to use the new version.".bright_green().bold());
+        exit(0);
+    }
+    
+    Ok(())
 }
 
 
