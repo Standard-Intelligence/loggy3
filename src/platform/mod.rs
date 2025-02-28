@@ -8,26 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use colored::*;
 use anyhow::Result;
 
-static EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-lazy_static::lazy_static! {
-    static ref MONOTONIC_START: Instant = Instant::now();
-}
-
-pub fn get_next_sequence() -> u64 {
-    EVENT_SEQUENCE.fetch_add(1, Ordering::SeqCst)
-}
-
-pub fn get_multi_timestamp() -> (u128, u64) {
-    let wall_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    
-    let monotonic_time = MONOTONIC_START.elapsed().as_millis() as u64;
-    
-    (wall_time, monotonic_time)
-}
+// Add import for VERBOSE from main
+use crate::VERBOSE;
 
 #[cfg(target_os = "macos")]
 pub mod mac;
@@ -39,135 +21,87 @@ pub mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::{get_display_info, unified_event_listener_thread_with_cache, check_and_request_permissions, get_target_matching_display_info, set_path_or_start_menu_shortcut, get_windows_version_type, check_windows_version_compatibility, WindowsVersionType, WindowsVersion, FFMPEG_ENCODER, FFMPEG_PIXEL_FORMAT, FFMPEG_FILENAME, FFMPEG_DOWNLOAD_URL};
 
-#[cfg(target_os = "macos")]
-pub static IS_WINDOWS: bool = false;
+static EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(target_os = "windows")]
-pub static IS_WINDOWS: bool = true;
+lazy_static::lazy_static! {
+    static ref MONOTONIC_START: Instant = Instant::now();
+}
+
+pub struct MultiTimestamp {
+    pub seq: u64,
+    pub wall_time: u128,
+    pub monotonic_time: u64,
+}
+
+
+pub fn get_multi_timestamp() -> MultiTimestamp {
+    let seq = EVENT_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+
+    let wall_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    
+    let monotonic_time = MONOTONIC_START.elapsed().as_millis() as u64;
+    
+    MultiTimestamp { seq, wall_time, monotonic_time }
+}
 
 pub struct LogWriterCache {
     session_dir: PathBuf,
-    keypress_writers: HashMap<usize, Arc<Mutex<BufWriter<File>>>>,
-    mouse_writers: HashMap<usize, Arc<Mutex<BufWriter<File>>>>,
-    raw_keypress_writers: HashMap<usize, Arc<Mutex<BufWriter<File>>>>,
+    event_writers: HashMap<(usize, String), Arc<Mutex<BufWriter<File>>>>,
 }
 
 impl LogWriterCache {
     pub fn new(session_dir: PathBuf) -> Self {
         Self {
             session_dir,
-            keypress_writers: HashMap::new(),
-            mouse_writers: HashMap::new(),
-            raw_keypress_writers: HashMap::new(),
+            event_writers: HashMap::new(),
         }
     }
 
-    fn get_keypress_writer(&mut self, timestamp_ms: u128) -> Result<Arc<Mutex<BufWriter<File>>>> {
+    fn get_writer(&mut self, timestamp_ms: u128, log_type: &str) -> Result<Arc<Mutex<BufWriter<File>>>> {
         let chunk_index = (timestamp_ms / 60000) as usize;
-        if !self.keypress_writers.contains_key(&chunk_index) {
+        let cache_key = (chunk_index, log_type.to_string());
+        
+        if !self.event_writers.contains_key(&cache_key) {
             let chunk_dir = self.session_dir.join(format!("chunk_{:05}", chunk_index));
             create_dir_all(&chunk_dir)?;
             
-            let log_path = chunk_dir.join("keypresses.log");
+            let log_path = chunk_dir.join(format!("{}.log", log_type));
             let writer = Arc::new(Mutex::new(BufWriter::new(File::create(log_path)?)));
-            println!("{}", format!("Created new keypress log for chunk {}", chunk_index).yellow());
-            self.keypress_writers.insert(chunk_index, writer);
+            println!("{}", format!("Created new {} log for chunk {}", log_type, chunk_index).yellow());
+            self.event_writers.insert(cache_key.clone(), writer);
         }
-        Ok(self.keypress_writers.get(&chunk_index).unwrap().clone())
-    }
-    
-    fn get_raw_keypress_writer(&mut self, timestamp_ms: u128) -> Result<Arc<Mutex<BufWriter<File>>>> {
-        let chunk_index = (timestamp_ms / 60000) as usize;
-        if !self.raw_keypress_writers.contains_key(&chunk_index) {
-            let chunk_dir = self.session_dir.join(format!("chunk_{:05}", chunk_index));
-            create_dir_all(&chunk_dir)?;
-            
-            let log_path = chunk_dir.join("raw_keypresses.log");
-            let writer = Arc::new(Mutex::new(BufWriter::new(File::create(log_path)?)));
-            println!("{}", format!("Created new raw keypress log for chunk {}", chunk_index).yellow());
-            self.raw_keypress_writers.insert(chunk_index, writer);
-        }
-        Ok(self.raw_keypress_writers.get(&chunk_index).unwrap().clone())
-    }
-    
-    fn get_mouse_writer(&mut self, timestamp_ms: u128) -> Result<Arc<Mutex<BufWriter<File>>>> {
-        let chunk_index = (timestamp_ms / 60000) as usize;
-        if !self.mouse_writers.contains_key(&chunk_index) {
-            let chunk_dir = self.session_dir.join(format!("chunk_{:05}", chunk_index));
-            create_dir_all(&chunk_dir)?;
-            
-            let log_path = chunk_dir.join("mouse.log");
-            let writer = Arc::new(Mutex::new(BufWriter::new(File::create(log_path)?)));
-            println!("{}", format!("Created new mouse log for chunk {}", chunk_index).yellow());
-            self.mouse_writers.insert(chunk_index, writer);
-        }
-        Ok(self.mouse_writers.get(&chunk_index).unwrap().clone())
+        Ok(self.event_writers.get(&cache_key).unwrap().clone())
     }
 }
 
-fn log_mouse_event_with_cache(_timestamp: u128, cache: &Arc<Mutex<LogWriterCache>>, data: &str) {
-    let seq = get_next_sequence();
-    let (wall_time, monotonic_time) = get_multi_timestamp();
-    let line = format!("({}, {}, {}, {})\n", seq, wall_time, monotonic_time, data);
-    
-    if let Ok(mut cache_lock) = cache.lock() {
-        if let Ok(writer) = cache_lock.get_mouse_writer(wall_time) {
-            if let Ok(mut writer_lock) = writer.lock() {
-                let _ = writer_lock.write_all(line.as_bytes());
-                let _ = writer_lock.flush();
-            }
-        }
-    }
-}
-
-fn handle_key_event_with_cache(
-    is_press: bool,
-    key: rdev::Key,
-    _timestamp: u128,
+pub fn handle_event_with_cache(
+    multi_timestamp: &MultiTimestamp,
+    data: String,
+    log_type: &str,
     cache: &Arc<Mutex<LogWriterCache>>,
-    pressed_keys: &Mutex<Vec<String>>,
 ) {
-    let key_str = format!("{:?}", key);
+    let raw_line = format!("[({}, {}, {}), '{}']\n", 
+        multi_timestamp.seq, 
+        multi_timestamp.wall_time, 
+        multi_timestamp.monotonic_time, 
+        data);
     
-    let (wall_time, monotonic_time) = get_multi_timestamp();
-    
-    let action = if is_press { "press" } else { "release" };
-    let raw_seq = get_next_sequence();
-    let raw_line = format!("({}, {}, {}, '{}', '{}')\n", raw_seq, wall_time, monotonic_time, action, key_str);
+    if VERBOSE.load(Ordering::SeqCst) {
+        match log_type {
+            "mouse" => println!("{}", raw_line.blue()),
+            "keypresses" => println!("{}", raw_line.green()),
+            _ => println!("{}", raw_line),
+        }
+    }
     
     if let Ok(mut cache_lock) = cache.lock() {
-        if let Ok(raw_writer) = cache_lock.get_raw_keypress_writer(wall_time) {
+        if let Ok(raw_writer) = cache_lock.get_writer(multi_timestamp.wall_time, log_type) {
             if let Ok(mut raw_writer_lock) = raw_writer.lock() {
                 let _ = raw_writer_lock.write_all(raw_line.as_bytes());
                 let _ = raw_writer_lock.flush();
-            }
-        }
-    }
-    
-    let mut keys = pressed_keys.lock().unwrap();
-
-    if is_press {
-        if !keys.contains(&key_str) {
-            keys.push(key_str.clone());
-        }
-    } else {
-        keys.retain(|k| k != &key_str);
-    }
-
-    let state = if keys.is_empty() {
-        "none".to_string()
-    } else {
-        format!("+{}", keys.join("+"))
-    };
-
-    let state_seq = get_next_sequence();
-    let line = format!("({}, {}, {}, '{}')\n", state_seq, wall_time, monotonic_time, state);
-    
-    if let Ok(mut cache_lock) = cache.lock() {
-        if let Ok(writer) = cache_lock.get_keypress_writer(wall_time) {
-            if let Ok(mut writer_lock) = writer.lock() {
-                let _ = writer_lock.write_all(line.as_bytes());
-                let _ = writer_lock.flush();
             }
         }
     }

@@ -79,7 +79,6 @@ struct Session {
     capture_threads: Vec<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
 
     writer_cache: Arc<Mutex<platform::LogWriterCache>>,
-    pressed_keys: Arc<Mutex<Vec<String>>>,
 
     error_rx: Receiver<()>,
     error_tx: Sender<()>,
@@ -114,7 +113,6 @@ impl Session {
         serde_json::to_writer_pretty(&mut f, &displays)?;
         
         let writer_cache = Arc::new(Mutex::new(platform::LogWriterCache::new(session_dir.clone())));
-        let pressed_keys = Arc::new(Mutex::new(vec![]));
 
         let (error_tx, error_rx) = mpsc::channel();
 
@@ -124,7 +122,6 @@ impl Session {
             event_thread: None,
             capture_threads: Vec::new(),
             writer_cache,
-            pressed_keys,
             error_rx,
             error_tx,
             displays,
@@ -134,12 +131,10 @@ impl Session {
     fn start(&mut self) {
         let should_run = self.should_run.clone();
         let writer_cache = self.writer_cache.clone();
-        let pressed_keys = self.pressed_keys.clone();
         self.event_thread = Some(thread::spawn(move || {
             platform::unified_event_listener_thread_with_cache(
                 should_run,
                 writer_cache,
-                pressed_keys,
             )
         }));
 
@@ -524,9 +519,7 @@ fn capture_display_impl(
         None => return,
     };
 
-    let (capturer_width, capturer_height) = if platform::IS_WINDOWS {
-        (display_info.original_width, display_info.original_height)
-    } else {
+    let (capturer_width, capturer_height) = if cfg!(target_os = "macos") {
         match capturer.lock() {
             Ok(mut c) => {
                 let sz = c.get_output_frame_size();
@@ -534,6 +527,8 @@ fn capture_display_impl(
             }
             Err(_) => return,
         }
+    } else {
+        (display_info.original_width, display_info.original_height)
     };
 
     let start_time_ms = SystemTime::now()
@@ -948,7 +943,7 @@ fn handle_capture_error(error_tx: &Sender<()>) {
 fn initialize_capturer(target: &Target) -> Option<Arc<Mutex<Capturer>>> {
     let opts = Options {
         fps: 30,
-        output_type: if platform::IS_WINDOWS { FrameType::BGRAFrame } else { FrameType::YUVFrame },
+        output_type: if cfg!(target_os = "macos") { FrameType::YUVFrame } else { FrameType::BGRAFrame },
         output_resolution: Resolution::_720p,
         target: Some(target.clone()),
         show_cursor: true,
@@ -1269,10 +1264,12 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
 
 
 fn write_frame_timestamp(frames_log: &mut BufWriter<File>) -> Result<()> {
-    let (wall_time, monotonic_time) = platform::get_multi_timestamp();
-    let seq = platform::get_next_sequence();
+    let multi_timestamp = platform::get_multi_timestamp();
     
-    writeln!(frames_log, "{}, {}, {}", seq, wall_time, monotonic_time)?;
+    writeln!(frames_log, "{}, {}, {}", 
+        multi_timestamp.seq, 
+        multi_timestamp.wall_time, 
+        multi_timestamp.monotonic_time)?;
     frames_log.flush()?;
 
     Ok(())

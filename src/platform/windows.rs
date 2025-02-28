@@ -1,20 +1,15 @@
-use std::fs::{File, create_dir_all, OpenOptions};
-use std::io::{BufWriter, Write, Read, BufReader, BufRead};
+use std::io::Read;
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio, exit, ExitStatus};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use lazy_static::lazy_static;
-use serde::{Serialize, Deserialize};
+use serde::Serialize;
 use colored::*;
-use dirs;
-use rdev;
 
 use winapi::shared::hidusage::{
     HID_USAGE_GENERIC_KEYBOARD, HID_USAGE_GENERIC_MOUSE, HID_USAGE_PAGE_GENERIC,
@@ -40,7 +35,7 @@ use windows_capture;
 use scap::Target;
 
 use crate::DisplayInfo;
-use super::{LogWriterCache, log_mouse_event_with_cache, handle_key_event_with_cache, get_multi_timestamp, get_next_sequence};
+use super::{LogWriterCache, handle_event_with_cache, get_multi_timestamp, MultiTimestamp};
 
 pub static FFMPEG_ENCODER: &str = "libx264";
 pub static FFMPEG_PIXEL_FORMAT: &str = "bgra";
@@ -187,41 +182,38 @@ lazy_static! {
 }
 
 /// Log a mouse event using the writer cache
-fn log_mouse_event_cached(event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCache>>) {
-    let timestamp = match event {
-        RawEvent::Delta { timestamp, .. } => *timestamp,
-        RawEvent::Wheel { timestamp, .. } => *timestamp,
-        RawEvent::Button { timestamp, .. } => *timestamp,
-        RawEvent::Key { timestamp, .. } => *timestamp,
-    };
+fn log_mouse_event_cached(multi_timestamp: &MultiTimestamp, event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCache>>) {
+    // let timestamp = match event {
+    //     RawEvent::Delta { timestamp, .. } => *timestamp,
+    //     RawEvent::Wheel { timestamp, .. } => *timestamp,
+    //     RawEvent::Button { timestamp, .. } => *timestamp,
+    //     RawEvent::Key { timestamp, .. } => *timestamp,
+    // };
     
     // Convert the event to a JSON string and add sequence number
     if let Ok(json_string) = serde_json::to_string(event) {
-        log_mouse_event_with_cache(timestamp, writer_cache, &json_string);
+        handle_event_with_cache(multi_timestamp, json_string, "mouse", writer_cache);
     }
 }
 
-/// Log a key event using the writer cache
 fn log_key_event_cached(event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCache>>, pressed_keys: &Arc<Mutex<Vec<String>>>) {
     if let RawEvent::Key { action, key_code, timestamp: _ } = event {
+        let multi_timestamp = get_multi_timestamp();
+
         let key_str = format!("VK_{}", key_code);
         let is_press = action == "press";
         
-        // Get multi-timestamp for more robust logging
-        let (wall_time, monotonic_time) = get_multi_timestamp();
+        let raw_line = format!("'{}', '{}'", action, key_str);
         
-        // Log the raw key event first with sequence number
-        let raw_seq = get_next_sequence();
-        let raw_line = format!("({}, {}, {}, '{}', '{}')", raw_seq, wall_time, monotonic_time, action, key_str);
-        
-        if let Ok(mut cache_lock) = writer_cache.lock() {
-            if let Ok(raw_writer) = cache_lock.get_raw_keypress_writer(wall_time) {
-                if let Ok(mut raw_writer_lock) = raw_writer.lock() {
-                    let _ = writeln!(raw_writer_lock, "{}", raw_line);
-                    let _ = raw_writer_lock.flush();
-                }
-            }
-        }
+        // if let Ok(mut cache_lock) = writer_cache.lock() {
+        //     if let Ok(raw_writer) = cache_lock.get_raw_keypress_writer(wall_time) {
+        //         if let Ok(mut raw_writer_lock) = raw_writer.lock() {
+        //             let _ = writeln!(raw_writer_lock, "{}", raw_line);
+        //             let _ = raw_writer_lock.flush();
+        //         }
+        //     }
+        // }
+        handle_event_with_cache(&multi_timestamp, raw_line, "raw_keypresses", writer_cache);
         
         // Continue with the existing state-tracking logic
         let mut keys = pressed_keys.lock().unwrap();
@@ -240,17 +232,15 @@ fn log_key_event_cached(event: &RawEvent, writer_cache: &Arc<Mutex<LogWriterCach
             format!("+{}", keys.join("+"))
         };
         
-        let state_seq = get_next_sequence();
-        let line = format!("({}, {}, {}, '{}')", state_seq, wall_time, monotonic_time, state);
-        
-        if let Ok(mut cache_lock) = writer_cache.lock() {
-            if let Ok(writer) = cache_lock.get_keypress_writer(wall_time) {
-                if let Ok(mut writer_lock) = writer.lock() {
-                    let _ = writeln!(writer_lock, "{}", line);
-                    let _ = writer_lock.flush();
-                }
-            }
-        }
+        // if let Ok(mut cache_lock) = writer_cache.lock() {
+        //     if let Ok(writer) = cache_lock.get_keypress_writer(wall_time) {
+        //         if let Ok(mut writer_lock) = writer.lock() {
+        //             let _ = writeln!(writer_lock, "{}", line);
+        //             let _ = writer_lock.flush();
+        //         }
+        //     }
+        // }
+        handle_event_with_cache(&multi_timestamp, state, "keypresses", writer_cache);
     }
 }
 
@@ -302,6 +292,7 @@ unsafe fn handle_raw_input_with_cache(
 
     match raw.header.dwType {
         RIM_TYPEMOUSE => {
+            let multi_timestamp = get_multi_timestamp();
             let mouse = raw.data.mouse();
             let flags = mouse.usButtonFlags;
             let wheel_delta = mouse.usButtonData as i16;
@@ -315,7 +306,7 @@ unsafe fn handle_raw_input_with_cache(
                     delta_y: last_y,
                     timestamp,
                 };
-                log_mouse_event_cached(&event, writer_cache);
+                log_mouse_event_cached(&multi_timestamp, &event, writer_cache);
             }
 
             // Wheel:
@@ -325,7 +316,7 @@ unsafe fn handle_raw_input_with_cache(
                     delta_y: wheel_delta as i32,
                     timestamp,
                 };
-                log_mouse_event_cached(&event, writer_cache);
+                log_mouse_event_cached(&multi_timestamp, &event, writer_cache);
             }
 
             // Buttons:
@@ -335,7 +326,7 @@ unsafe fn handle_raw_input_with_cache(
                     button: "Left".to_string(),
                     timestamp,
                 };
-                log_mouse_event_cached(&event, writer_cache);
+                log_mouse_event_cached(&multi_timestamp, &event, writer_cache);
             }
             if (flags & RI_MOUSE_LEFT_BUTTON_UP) != 0 {
                 let event = RawEvent::Button {
@@ -343,7 +334,7 @@ unsafe fn handle_raw_input_with_cache(
                     button: "Left".to_string(),
                     timestamp,
                 };
-                log_mouse_event_cached(&event, writer_cache);
+                log_mouse_event_cached(&multi_timestamp, &event, writer_cache);
             }
             if (flags & RI_MOUSE_RIGHT_BUTTON_DOWN) != 0 {
                 let event = RawEvent::Button {
@@ -351,7 +342,7 @@ unsafe fn handle_raw_input_with_cache(
                     button: "Right".to_string(),
                     timestamp,
                 };
-                log_mouse_event_cached(&event, writer_cache);
+                log_mouse_event_cached(&multi_timestamp, &event, writer_cache);
             }
             if (flags & RI_MOUSE_RIGHT_BUTTON_UP) != 0 {
                 let event = RawEvent::Button {
@@ -359,7 +350,7 @@ unsafe fn handle_raw_input_with_cache(
                     button: "Right".to_string(),
                     timestamp,
                 };
-                log_mouse_event_cached(&event, writer_cache);
+                log_mouse_event_cached(&multi_timestamp, &event, writer_cache);
             }
             if (flags & RI_MOUSE_MIDDLE_BUTTON_DOWN) != 0 {
                 let event = RawEvent::Button {
@@ -367,7 +358,7 @@ unsafe fn handle_raw_input_with_cache(
                     button: "Middle".to_string(),
                     timestamp,
                 };
-                log_mouse_event_cached(&event, writer_cache);
+                log_mouse_event_cached(&multi_timestamp, &event, writer_cache);
             }
             if (flags & RI_MOUSE_MIDDLE_BUTTON_UP) != 0 {
                 let event = RawEvent::Button {
@@ -375,7 +366,7 @@ unsafe fn handle_raw_input_with_cache(
                     button: "Middle".to_string(),
                     timestamp,
                 };
-                log_mouse_event_cached(&event, writer_cache);
+                log_mouse_event_cached(&multi_timestamp, &event, writer_cache);
             }
         }
         RIM_TYPEKEYBOARD => {
