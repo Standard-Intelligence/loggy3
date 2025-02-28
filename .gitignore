@@ -5,3 +5,4 @@ Cargo.lock
 *.downloading
 resources/
 __pycache__/
+data/

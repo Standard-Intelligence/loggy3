@@ -3,860 +3,906 @@
 import os
 import json
 import re
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional, Union
+import torch as T
+from einops import rearrange
+import cv2
+import numpy as np
+from collections import Counter, defaultdict
+import matplotlib.pyplot as plt
+from datetime import timedelta
+import logging
+import pathlib
 
-@dataclass
-class FrameEvent:
-    """Frame captured from a display"""
-    seq: int
-    monotonic_time: int  # Monotonic timestamp in ms
-    display_id: int
-    
-@dataclass
-class KeypressEvent:
-    """Keyboard event (key press or release)"""
-    seq: int
-    monotonic_time: int  # Monotonic timestamp in ms
-    action: str          # "down" or "up"
-    key_code: int        # macOS CGKeyCode value
-    modifiers: List[str] = None  # List of active modifiers: shift, control, option/alt, command
-    
-@dataclass
-class MouseEvent:
-    """Mouse event (movement, click, scroll)"""
-    seq: int
-    monotonic_time: int  # Monotonic timestamp in ms
-    action: str          # "move", "down", "up", "scroll"
-    x: float             # Screen X coordinate
-    y: float             # Screen Y coordinate
-    button: Optional[int] = None    # Button number (0=left, 1=right, 2=middle)
-    delta_x: Optional[float] = None  # Movement in X direction
-    delta_y: Optional[float] = None  # Movement in Y direction
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('timeline')
 
 @dataclass
 class TimelineEvent:
-    """Unified timeline event containing any event type"""
-    seq: int
-    monotonic_time: int
-    event_type: str  # "frame", "keypress", "mouse"
-    data: Union[FrameEvent, KeypressEvent, MouseEvent]
+    seq: int # temporal sequence position
+    time: int # milliseconds since start of chunk
+
+@dataclass
+class FrameEvent(TimelineEvent):
+    pixels: T.Tensor # [H, W, C]
+
+@dataclass
+class PositionEvent(TimelineEvent):
+    x: float # screen coordinates
+    y: float
+    
+@dataclass
+class TimelineScrollEvent(TimelineEvent):
+    scroll_x: int # scroll deltas
+    scroll_y: int
+
+@dataclass
+class TimelinePressEvent(TimelineEvent):
+    key: int # key code or mouse button
+    down: bool # down or up
+
+
+@dataclass
+class ComputerEvent:
+    seq: int # temporal sequence position
+    dur: float # [0,1.0) = [milliseconds till next event] / 33ms
+
+@dataclass
+class PatchEvent(ComputerEvent):
+    pixels: T.Tensor # [H, W, C]
+    grid_x: int # patch grid position
+    grid_y: int
+
+@dataclass
+class MoveEvent(ComputerEvent):
+    delta_x: float # screen coordinate deltas
+    delta_y: float
+
+@dataclass
+class ScrollEvent(ComputerEvent):
+    scroll_x: int # scroll deltas
+    scroll_y: int
+
+@dataclass
+class PressEvent(ComputerEvent):
+    key: int # key code or mouse button
+    down: bool # down or up
+
+SPECIAL_KEYS = {
+    # outside of the normal keycode range
+    "alphaShift": 1001,
+    "shift": 1002,
+    "control": 1003,
+    "alternate": 1004,
+    "command": 1005,
+    "help": 1006,
+    "secondaryFn": 1007,
+    "numericPad": 1008,
+    "nonCoalesced": 1009,
+
+    # mouse buttons
+    "LeftMouse": 1010,
+    "RightMouse": 1011,    
+}
+
+# Reverse mapping for analytics
+SPECIAL_KEYS_REVERSE = {v: k for k, v in SPECIAL_KEYS.items()}
+PATCH_SIZE = 10
+
+def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent | TimelineScrollEvent | TimelinePressEvent]) -> List[ComputerEvent]:
+    logger.info(f"Converting {len(timeline_events)} timeline events to computer events")
+    timeline_events = sorted(timeline_events, key=lambda x: x.seq)
+    computer_events = []
+    mouse_pos = None
+    screenstate = None
+    
+    # Tracking variables for patching analytics
+    frame_count = 0
+    total_patches = 0
+    active_patches_per_frame = []
+    patch_activity_heatmap = defaultdict(int)
+    
+    for i, event in enumerate(timeline_events):
+        event_dur = 1.0
+        if i < len(timeline_events) - 1:
+            event_dur = (timeline_events[i+1].time - event.time) / 33.0
+            if event_dur > 1.0:
+                event_dur = 1.0
+        match event:
+            case FrameEvent():
+                frame_count += 1
+                pixels = event.pixels.float()
+                logger.debug(f"Processing frame {frame_count} with shape {pixels.shape}")
+                assert pixels.shape[0] % PATCH_SIZE == 0 and pixels.shape[1] % PATCH_SIZE == 0, f"Pixels shape {pixels.shape} is not divisible by patch size {PATCH_SIZE}"
+                
+                # Calculate grid dimensions for logging
+                grid_height = pixels.shape[0] // PATCH_SIZE
+                grid_width = pixels.shape[1] // PATCH_SIZE
+                logger.debug(f"Frame grid dimensions: {grid_height}x{grid_width} patches")
+                
+                pixels = rearrange(pixels, "(h p1) (w p2) c -> (h w) p1 p2 c", p1=PATCH_SIZE, p2=PATCH_SIZE)
+                if screenstate is None:
+                    screenstate = T.zeros_like(pixels)
+                    logger.info(f"Initialized screenstate with shape {screenstate.shape}")
+                
+                state_diff = T.abs(pixels - screenstate).mean(dim=(1,2,3))
+                active_patches = state_diff > 10.0
+                active_patches_idx = T.nonzero(active_patches, as_tuple=False)
+                
+                # Log patch activity for this frame
+                active_count = len(active_patches_idx)
+                total_patches += active_count
+                active_patches_per_frame.append(active_count)
+                logger.debug(f"Frame {frame_count}: {active_count} active patches out of {len(state_diff)} total patches ({active_count/len(state_diff)*100:.2f}%)")
+                
+                for patch_idx in active_patches_idx:
+                    patch_idx_val = int(patch_idx.item())  # Convert tensor to int
+                    patch_y = patch_idx_val // grid_width
+                    patch_x = patch_idx_val % grid_width
+                    
+                    # Update heatmap
+                    patch_activity_heatmap[(patch_x, patch_y)] += 1
+                    
+                    computer_events.append(PatchEvent(
+                        seq=event.seq, dur=event_dur, pixels=pixels[patch_idx_val], grid_x=int(patch_x), grid_y=int(patch_y)))
+                
+                screenstate = pixels
+            case PositionEvent():
+                if mouse_pos is None:
+                    mouse_pos = (event.x, event.y)
+                computer_events.append(MoveEvent(
+                    seq=event.seq, dur=event_dur, delta_x=event.x - mouse_pos[0], delta_y=event.y - mouse_pos[1]))
+                mouse_pos = (event.x, event.y)
+            case TimelineScrollEvent():
+                computer_events.append(ScrollEvent(
+                    seq=event.seq, dur=event_dur, scroll_x=event.scroll_x, scroll_y=event.scroll_y))
+            case TimelinePressEvent():
+                computer_events.append(PressEvent(
+                    seq=event.seq, dur=event_dur, key=event.key, down=event.down))
+    
+    # Log summary statistics
+    if frame_count > 0:
+        logger.info(f"Processed {frame_count} frames with {total_patches} active patches")
+        logger.info(f"Average active patches per frame: {total_patches/frame_count:.2f}")
+        if active_patches_per_frame:
+            logger.info(f"Min active patches: {min(active_patches_per_frame)}, Max: {max(active_patches_per_frame)}")
+    
+    # Store analytics data for later use
+    timeline_to_computer_events.analytics = {
+        'frame_count': frame_count,
+        'total_patches': total_patches,
+        'active_patches_per_frame': active_patches_per_frame,
+        'patch_activity_heatmap': dict(patch_activity_heatmap)
+    }
+    
+    return computer_events
 
 class Timeline:
-    def __init__(self, session_dir: str):
-        self.session_dir = session_dir
-        self.events: List[TimelineEvent] = []
-        self.load_session()
+    def __init__(self, chunk_dir: str, output_dir: Optional[str] = None):
+        self.chunk_dir = chunk_dir
         
-    def load_session(self):
-        # Get information about displays
-        display_info = self._load_display_info()
-        
-        # Find all chunk directories in the session
-        chunk_dirs = sorted([d for d in os.listdir(self.session_dir) 
-                            if os.path.isdir(os.path.join(self.session_dir, d)) and d.startswith('chunk_')])
-        
-        for chunk_dir in chunk_dirs:
-            chunk_path = os.path.join(self.session_dir, chunk_dir)
+        # Set up output directory
+        if output_dir is None:
+            # Extract chunk name from path
+            chunk_name = os.path.basename(os.path.normpath(chunk_dir))
+            # Create default output directory
+            self.output_dir = os.path.join("./data", f"{chunk_name}_analysis")
+        else:
+            self.output_dir = output_dir
             
-            # Load frames for each display
-            for display_id, display_data in display_info.items():
-                # Find the display directory in this chunk
-                display_dir_prefix = f"display_{display_id}_"
-                display_dirs = [d for d in os.listdir(chunk_path) 
-                               if os.path.isdir(os.path.join(chunk_path, d)) and d.startswith(display_dir_prefix)]
-                
-                if not display_dirs:
-                    continue
-                    
-                display_dir = display_dirs[0]  # Should only be one directory per display
-                frames_log = os.path.join(chunk_path, display_dir, "frames.log")
-                
-                if os.path.exists(frames_log):
-                    self._load_frames(frames_log, display_id, display_data['title'])
-            
-            # Load keypress events
-            keypresses_log = os.path.join(chunk_path, "keypresses.log")
-            if os.path.exists(keypresses_log):
-                self._load_keypresses(keypresses_log)
-                
-            # Load mouse events
-            mouse_log = os.path.join(chunk_path, "mouse.log")
-            if os.path.exists(mouse_log):
-                self._load_mouse_events(mouse_log)
+        # Create output directory if it doesn't exist
+        os.makedirs(self.output_dir, exist_ok=True)
+        logger.info(f"Analysis outputs will be saved to: {self.output_dir}")
         
-        # Sort all events by monotonic time to ensure correct order
-        self.events.sort(key=lambda x: x.monotonic_time)
-        
-    def _load_display_info(self) -> Dict[int, Dict[str, Any]]:
-        display_info_path = os.path.join(self.session_dir, "display_info.json")
-        if not os.path.exists(display_info_path):
-            return {}
-            
-        with open(display_info_path, 'r') as f:
-            display_data = json.load(f)
-            
-        # Create a dictionary with display ID as key
-        return {d['id']: d for d in display_data}
-    
-    def _load_frames(self, frames_log_path: str, display_id: int, display_title: str):
-        with open(frames_log_path, 'r') as f:
+        self.timeline_events = self.load_chunk()
+        self.events = timeline_to_computer_events(self.timeline_events)
+        # Store analytics data
+        self.patching_analytics = getattr(timeline_to_computer_events, 'analytics', {})
+
+    def load_chunk(self):
+        display_dirs = [d for d in os.listdir(self.chunk_dir) 
+                       if os.path.isdir(os.path.join(self.chunk_dir, d)) and d.startswith("display_")]
+        if not display_dirs: raise ValueError(f"No display directories found in {self.chunk_dir}")
+        main_display_dir = os.path.join(self.chunk_dir, display_dirs[0])
+        frames = self.load_frames(main_display_dir)
+
+        keypresses_log = os.path.join(self.chunk_dir, "keypresses.log")
+        if not os.path.exists(keypresses_log): raise ValueError(f"No keypresses log found in {self.chunk_dir}")
+        keypresses = self.load_keypresses(keypresses_log)
+
+        mouse_log = os.path.join(self.chunk_dir, "mouse.log")
+        if not os.path.exists(mouse_log): raise ValueError(f"No mouse log found in {self.chunk_dir}")
+        mouse = self.load_mouse(mouse_log)
+
+        return frames + keypresses + mouse
+
+    def load_frames(self, display_dir: str) -> List[FrameEvent]:
+        video_path = os.path.join(display_dir, "video.mp4")
+        if not os.path.exists(video_path): raise ValueError(f"No video found in {display_dir}")
+        video = cv2.VideoCapture(video_path)
+        frames = []
+        while video.isOpened():
+            ret, frame = video.read()
+            if not ret: break
+            frames.append(T.from_numpy(frame))
+        video.release()
+
+        frames_log_path = os.path.join(display_dir, "frames.log")
+        if not os.path.exists(frames_log_path): raise ValueError(f"No frames log found in {display_dir}")
+        timings = []
+        with open(frames_log_path, "r") as f:
             for line in f:
-                try:
-                    # Format is: seq, wall_time, monotonic_time
-                    seq, wall_time, monotonic_time = map(int, line.strip().split(', '))
-                    
-                    # Simplified frame event with just essential data for model training
-                    frame_event = FrameEvent(
-                        seq=seq,
-                        monotonic_time=monotonic_time,
-                        display_id=display_id
-                    )
-                    
-                    timeline_event = TimelineEvent(
-                        seq=seq,
-                        monotonic_time=monotonic_time,
-                        event_type="frame",
-                        data=frame_event
-                    )
-                    
-                    self.events.append(timeline_event)
-                except Exception as e:
-                    print(f"Error parsing frame log line: {line.strip()} - {str(e)}")
+                seq, _, monotonic_time = map(int, line.strip().split(', '))
+                timings.append((seq, monotonic_time))
+        assert timings == sorted(timings, key=lambda x: x[0])
+        assert len(timings) == len(frames)
+
+        return [FrameEvent(seq=seq, time=time, pixels=frame) for (seq, time), frame in zip(timings, frames)]
     
-    def _load_keypresses(self, keypresses_log_path: str):
-        with open(keypresses_log_path, 'r') as f:
+    def load_keypresses(self, keypresses_log: str) -> List[TimelinePressEvent]:
+        keypress_raws = []
+        with open(keypresses_log, "r") as f:
             for line in f:
-                try:
-                    # Parse the line with regex to handle the JSON data
-                    match = re.match(r'\[\((\d+), (\d+), (\d+)\), \'(.*)\'\]', line.strip())
-                    if match:
-                        seq, wall_time, monotonic_time, data_str = match.groups()
-                        seq, wall_time, monotonic_time = int(seq), int(wall_time), int(monotonic_time)
-                        
-                        # Parse the JSON data
-                        event_data = json.loads(data_str)
-                        event_type = event_data['type']
-                        
-                        # Skip events we don't need for the model
-                        if event_type not in ['key_down', 'key_up']:
-                            continue
-                        
-                        # Extract modifiers from flags
-                        modifiers = []
-                        flags_detail = event_data.get('flagsDetail', {})
-                        if flags_detail:
-                            if flags_detail.get('shift'):
-                                modifiers.append('shift')
-                            if flags_detail.get('control'):
-                                modifiers.append('control')
-                            if flags_detail.get('alternate'):  # Option/Alt key
-                                modifiers.append('option')
-                            if flags_detail.get('command'):
-                                modifiers.append('command')
-                        
-                        # Map event type to simpler action
-                        action = "down" if event_type == "key_down" else "up"
-                        
-                        # Create simplified keypress event
-                        keypress_event = KeypressEvent(
-                            seq=seq,
-                            monotonic_time=monotonic_time,
-                            action=action,
-                            key_code=event_data.get('keycode', 0),
-                            modifiers=modifiers
-                        )
-                        
-                        timeline_event = TimelineEvent(
-                            seq=seq,
-                            monotonic_time=monotonic_time,
-                            event_type="keypress",
-                            data=keypress_event
-                        )
-                        
-                        self.events.append(timeline_event)
-                except Exception as e:
-                    print(f"Error parsing keypress log line: {line.strip()} - {str(e)}")
-    
-    def _load_mouse_events(self, mouse_log_path: str):
-        with open(mouse_log_path, 'r') as f:
+                keypress_raws.append(eval(line.strip()))
+        keypress_timings = []
+        keypress_jsons = []
+        for keypress_raw in keypress_raws:
+            seq, _, monotonic_time = keypress_raw[0]
+            keypress_timings.append((seq, monotonic_time))
+            keypress_jsons.append(json.loads(keypress_raw[1]))
+        assert len(keypress_timings) == len(keypress_jsons)
+
+        keypress_types: List[Tuple[int, bool]] = []
+        for keypress_json in keypress_jsons:
+            match keypress_json["type"]:
+                case "key_down":
+                    keypress_types.append((keypress_json["keycode"], True))
+                case "key_up":
+                    keypress_types.append((keypress_json["keycode"], False))
+                case "flags_changed":
+                    if len(keypress_json["flagsChanged"].keys()) != 1: 
+                        logger.warning(f"Expected only one key in flagsChanged, but got {keypress_json['flagsChanged'].keys()}")
+                    flag_key, flag_value = next(iter(keypress_json["flagsChanged"].items()))
+                    is_pressed = flag_value == "pressed"
+                    keypress_types.append((SPECIAL_KEYS[flag_key], is_pressed))
+                case _:
+                    raise ValueError(f"Unknown keypress type: {keypress_json['type']}")
+        assert len(keypress_timings) == len(keypress_types)
+
+        return [TimelinePressEvent(
+            seq=seq, 
+            time=monotonic_time, 
+            key=key, 
+            down=down) for (seq, monotonic_time), (key, down) in zip(keypress_timings, keypress_types)]
+
+    def load_mouse(self, mouse_log: str) -> List[Union[PositionEvent, TimelineScrollEvent, TimelinePressEvent]]:
+        mouse_raws = []
+        with open(mouse_log, "r") as f:
             for line in f:
-                try:
-                    # Parse the line with regex to handle the JSON data
-                    match = re.match(r'\[\((\d+), (\d+), (\d+)\), \'(.*)\'\]', line.strip())
-                    if match:
-                        seq, wall_time, monotonic_time, data_str = match.groups()
-                        seq, wall_time, monotonic_time = int(seq), int(wall_time), int(monotonic_time)
-                        
-                        # Parse the JSON data
-                        event_data = json.loads(data_str)
-                        event_type = event_data['type']
-                        
-                        # Get location data
-                        location = event_data.get('location', {'x': 0, 'y': 0})
-                        x = location.get('x', 0)
-                        y = location.get('y', 0)
-                        
-                        # Map event types to simplified actions
-                        action_map = {
-                            'mouse_movement': 'move',
-                            'mouse_down': 'down',
-                            'mouse_up': 'up',
-                            'scroll_wheel': 'scroll',
-                            'left_mouse_dragged': 'move',
-                            'right_mouse_dragged': 'move'
-                        }
-                        
-                        action = action_map.get(event_type, 'unknown')
-                        
-                        # Create simplified mouse event
-                        mouse_event = MouseEvent(
-                            seq=seq,
-                            monotonic_time=monotonic_time,
-                            action=action,
-                            x=x,
-                            y=y,
-                            button=event_data.get('buttonNumber'),
-                            delta_x=event_data.get('deltaX'),
-                            delta_y=event_data.get('deltaY')
-                        )
-                        
-                        timeline_event = TimelineEvent(
-                            seq=seq,
-                            monotonic_time=monotonic_time,
-                            event_type="mouse",
-                            data=mouse_event
-                        )
-                        
-                        self.events.append(timeline_event)
-                except Exception as e:
-                    print(f"Error parsing mouse log line: {line.strip()} - {str(e)}")
-    
-    def get_events_in_time_range(self, start_time: int, end_time: int) -> List[TimelineEvent]:
-        """Get all events within a specific monotonic time range"""
-        return [event for event in self.events 
-                if start_time <= event.monotonic_time <= end_time]
-    
-    def get_events_by_type(self, event_type: str) -> List[TimelineEvent]:
-        """Get all events of a specific type (frame, keypress, mouse)"""
-        return [event for event in self.events if event.event_type == event_type]
-    
-    def get_frame_events_for_display(self, display_id: int) -> List[TimelineEvent]:
-        """Get all frame events for a specific display"""
-        return [event for event in self.events 
-                if event.event_type == "frame" and 
-                isinstance(event.data, FrameEvent) and 
-                event.data.display_id == display_id]
-                
-    def export_for_training(self, output_path: str):
-        """Export the timeline in a format suitable for model training"""
-        training_data = []
-        
-        for event in self.events:
-            if event.event_type == "frame":
-                data = {
-                    "type": "frame",
-                    "time": event.monotonic_time,
-                    "display_id": event.data.display_id,
-                    "seq": event.seq
-                }
-            elif event.event_type == "keypress":
-                data = {
-                    "type": "keypress",
-                    "time": event.monotonic_time,
-                    "action": event.data.action,
-                    "key_code": event.data.key_code,
-                    "modifiers": event.data.modifiers or []
-                }
-            elif event.event_type == "mouse":
-                data = {
-                    "type": "mouse",
-                    "time": event.monotonic_time,
-                    "action": event.data.action,
-                    "x": event.data.x,
-                    "y": event.data.y,
-                    "button": event.data.button,
-                    "delta_x": event.data.delta_x,
-                    "delta_y": event.data.delta_y
-                }
-            else:
-                continue
-                
-            training_data.append(data)
-            
-        with open(output_path, 'w') as f:
-            json.dump(training_data, f)
-            
-        print(f"Exported {len(training_data)} events to {output_path}")
-        
-    def create_sequence_dataset(self, sequence_length: int = 100, stride: int = 10) -> List[Dict]:
-        """Create a dataset of fixed-length sequences for training sequential models
-        
-        Args:
-            sequence_length: Number of events in each sequence
-            stride: Step size between sequences
-            
-        Returns:
-            List of sequences, each containing events and target information
-        """
-        sequences = []
-        
-        if len(self.events) < sequence_length:
-            print(f"Warning: Timeline has fewer events ({len(self.events)}) than requested sequence length ({sequence_length})")
-            return sequences
-            
-        for i in range(0, len(self.events) - sequence_length, stride):
-            # Get a window of events
-            window = self.events[i:i + sequence_length]
-            
-            # Extract relevant features
-            sequence_data = {
-                "events": [],
-                "start_time": window[0].monotonic_time,
-                "end_time": window[-1].monotonic_time,
-                "duration_ms": window[-1].monotonic_time - window[0].monotonic_time
-            }
-            
-            # Process each event in the window
-            for event in window:
-                if event.event_type == "frame":
-                    event_data = {
-                        "type": "frame",
-                        "time": event.monotonic_time,
-                        "display_id": event.data.display_id
-                    }
-                elif event.event_type == "keypress":
-                    event_data = {
-                        "type": "keypress",
-                        "time": event.monotonic_time,
-                        "action": event.data.action,
-                        "key_code": event.data.key_code,
-                        "modifiers": event.data.modifiers or []
-                    }
-                elif event.event_type == "mouse":
-                    event_data = {
-                        "type": "mouse",
-                        "time": event.monotonic_time,
-                        "action": event.data.action,
-                        "x": event.data.x,
-                        "y": event.data.y,
-                        "delta_x": event.data.delta_x if event.data.delta_x is not None else 0,
-                        "delta_y": event.data.delta_y if event.data.delta_y is not None else 0
-                    }
-                else:
-                    continue
-                    
-                sequence_data["events"].append(event_data)
-            
-            # Count event types in this sequence
-            event_types = [e["type"] for e in sequence_data["events"]]
-            sequence_data["counts"] = {
-                "frame": event_types.count("frame"),
-                "keypress": event_types.count("keypress"),
-                "mouse": event_types.count("mouse")
-            }
-            
-            sequences.append(sequence_data)
-            
-        return sequences
-    
-    def get_closest_frame(self, time: int, display_id: Optional[int] = None) -> Optional[TimelineEvent]:
-        """Find the closest frame to a specific monotonic time, optionally for a specific display"""
-        frames = self.get_events_by_type("frame")
-        if display_id is not None:
-            frames = [f for f in frames if isinstance(f.data, FrameEvent) and f.data.display_id == display_id]
-            
-        if not frames:
-            return None
-            
-        return min(frames, key=lambda x: abs(x.monotonic_time - time))
-    
+                mouse_raws.append(eval(line.strip()))
+        mouse_timings = []
+        mouse_jsons = []
+        for mouse_raw in mouse_raws:
+            seq, _, monotonic_time = mouse_raw[0]
+            mouse_timings.append((seq, monotonic_time))
+            mouse_jsons.append(json.loads(mouse_raw[1]))
+        assert len(mouse_timings) == len(mouse_jsons)
+
+        mouse_types: List[Union[Tuple[str, float, float], Tuple[str, int, bool], Tuple[str, int, int]]] = []
+        for mouse_json in mouse_jsons:
+            match mouse_json["type"]:
+                case "mouse_movement":
+                    mouse_types.append(('position', mouse_json["location"]["x"], mouse_json["location"]["y"]))
+                case "mouse_down":
+                    mouse_code = SPECIAL_KEYS[mouse_json["eventType"].replace("Down", "")]
+                    mouse_types.append(('press', mouse_code, True))
+                case "mouse_up":
+                    mouse_code = SPECIAL_KEYS[mouse_json["eventType"].replace("Up", "")]
+                    mouse_types.append(('press', mouse_code, False))
+                case "scroll_wheel":
+                    mouse_types.append(('scroll', mouse_json["pointDeltaAxis1"], mouse_json["pointDeltaAxis2"]))
+                case _:
+                    raise ValueError(f"Unknown mouse type: {mouse_json['type']}")
+        assert len(mouse_timings) == len(mouse_types)
+
+        events = []
+        for (seq, monotonic_time), (event_type, *args) in zip(mouse_timings, mouse_types):
+            match event_type:
+                case 'position':
+                    events.append(PositionEvent(seq=seq, time=monotonic_time, x=args[0], y=args[1]))
+                case 'press':
+                    events.append(TimelinePressEvent(seq=seq, time=monotonic_time, key=int(args[0]), down=bool(args[1])))
+                case 'scroll':
+                    events.append(TimelineScrollEvent(seq=seq, time=monotonic_time, scroll_x=int(args[0]), scroll_y=int(args[1])))
+        return events
+
     def __len__(self):
         return len(self.events)
     
     def __getitem__(self, index):
         return self.events[index]
-
-# Example usage
-def render_timeline_to_video(timeline, output_path, display_id=None, start_time=None, end_time=None, output_fps=30, max_frames=None):
-    """Render timeline events as a video overlay on the captured frames
     
-    Args:
-        timeline: Timeline object containing all events
-        output_path: Path to save the rendered video
-        display_id: Optional display ID to render (if None, render first available display)
-        start_time: Optional start time in ms (if None, start from beginning)
-        end_time: Optional end time in ms (if None, continue to end)
-        output_fps: FPS for the output video
-        max_frames: Maximum number of frames to render
+    def render_reconstructed_video(self, output_path=None, fps=30, highlight_active=True, highlight_color=(0, 165, 255), highlight_opacity=0.3):
+        """
+        Render a video reconstructed from the active patches.
         
-    Returns:
-        Path to the rendered video if successful, None otherwise
-    """
-    import cv2
-    import os
-    from datetime import datetime
-    
-    # First, filter events by time range if specified
-    events = timeline.events
-    if start_time is not None or end_time is not None:
-        start = start_time if start_time is not None else 0
-        end = end_time if end_time is not None else float('inf')
-        events = [e for e in events if start <= e.monotonic_time <= end]
+        Args:
+            output_path: Path to save the video. If None, will save to the output directory.
+            fps: Frames per second for the output video.
+            highlight_active: Whether to highlight active patches with an overlay.
+            highlight_color: BGR color tuple for the highlight overlay (default is orange in BGR).
+            highlight_opacity: Opacity of the highlight overlay (0.0 to 1.0).
         
-    if not events:
-        print("No events to render in the specified time range")
-        return None
+        Returns:
+            Path to the saved video file.
+        """
+        if not output_path:
+            output_path = os.path.join(self.output_dir, "reconstructed_video.mp4")
         
-    # Get all frame events
-    frame_events = [e for e in events if e.event_type == "frame"]
-    if not frame_events:
-        print("No frame events found to render")
-        return None
-        
-    # Get display information
-    display_info_path = os.path.join(timeline.session_dir, "display_info.json")
-    if not os.path.exists(display_info_path):
-        print(f"Display info not found at {display_info_path}")
-        return None
-        
-    with open(display_info_path, 'r') as f:
-        display_info = json.load(f)
-        
-    # Filter frames by display_id if specified
-    if display_id is not None:
-        frame_events = [e for e in frame_events if isinstance(e.data, FrameEvent) and e.data.display_id == display_id]
-        display_data = next((d for d in display_info if d['id'] == display_id), None)
-        if not display_data:
-            print(f"Display ID {display_id} not found in display info")
-            return None
-    else:
-        # Use the first available display
+        # Find all FrameEvents to get original dimensions
+        frame_events = [event for event in self.timeline_events if isinstance(event, FrameEvent)]
         if not frame_events:
-            print("No frame events found for any display")
+            logger.error("No frame events found, cannot reconstruct video")
             return None
-        display_id = frame_events[0].data.display_id
-        display_data = next((d for d in display_info if d['id'] == display_id), None)
-        if not display_data:
-            print(f"Display ID {display_id} not found in display info")
+        
+        # Get dimensions from the first frame
+        first_frame = frame_events[0].pixels
+        height, width = first_frame.shape[0], first_frame.shape[1]
+        
+        # Create a video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v') # type: ignore
+        video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        # Sort events by sequence number
+        patch_events = sorted([event for event in self.events if isinstance(event, PatchEvent)], 
+                             key=lambda x: x.seq)
+        
+        # Group patch events by sequence number (frame)
+        patch_events_by_seq = defaultdict(list)
+        for event in patch_events:
+            patch_events_by_seq[event.seq].append(event)
+        
+        # Initialize the screen state
+        screen = np.zeros((height, width, 3), dtype=np.uint8)
+        grid_height = height // PATCH_SIZE
+        grid_width = width // PATCH_SIZE
+        
+        logger.info(f"Reconstructing video with dimensions {height}x{width} ({grid_height}x{grid_width} patches)")
+        
+        # Process each frame
+        frame_count = 0
+        for seq in sorted(patch_events_by_seq.keys()):
+            events = patch_events_by_seq[seq]
+            
+            # Apply all patches for this frame
+            for event in events:
+                # Convert patch to numpy and place it in the correct position
+                patch = event.pixels.numpy()
+                y_start = event.grid_y * PATCH_SIZE
+                y_end = y_start + PATCH_SIZE
+                x_start = event.grid_x * PATCH_SIZE
+                x_end = x_start + PATCH_SIZE
+                
+                # Ensure we don't go out of bounds
+                if y_end <= height and x_end <= width:
+                    # Update the screen state with the patch
+                    screen[y_start:y_end, x_start:x_end] = patch
+            
+            # Create a copy of the screen for this frame
+            frame = screen.copy()
+            
+            # Add orange overlay to active patches if highlighting is enabled
+            if highlight_active and events:
+                # Create an overlay mask for active patches
+                overlay = np.zeros_like(frame, dtype=np.uint8)
+                
+                # Fill in the overlay for each active patch
+                for event in events:
+                    y_start = event.grid_y * PATCH_SIZE
+                    y_end = y_start + PATCH_SIZE
+                    x_start = event.grid_x * PATCH_SIZE
+                    x_end = x_start + PATCH_SIZE
+                    
+                    if y_end <= height and x_end <= width:
+                        # Fill the patch area with the highlight color
+                        overlay[y_start:y_end, x_start:x_end] = highlight_color
+                
+                # Apply the overlay with the specified opacity
+                cv2.addWeighted(overlay, highlight_opacity, frame, 1.0, 0, frame)
+            
+            # Write the frame
+            video_writer.write(frame)
+            frame_count += 1
+            
+            if frame_count % 100 == 0:
+                logger.info(f"Processed {frame_count} frames")
+        
+        video_writer.release()
+        logger.info(f"Reconstructed video saved to {output_path} with {frame_count} frames")
+        return output_path
+    
+    def generate_patch_heatmap(self, output_path=None):
+        """
+        Generate a heatmap showing which patches were most active.
+        
+        Args:
+            output_path: Path to save the heatmap image. If None, will save to the output directory.
+            
+        Returns:
+            Path to the saved heatmap image.
+        """
+        if not output_path:
+            output_path = os.path.join(self.output_dir, "patch_activity_heatmap.png")
+        
+        # Find all FrameEvents to get original dimensions
+        frame_events = [event for event in self.timeline_events if isinstance(event, FrameEvent)]
+        if not frame_events:
+            logger.error("No frame events found, cannot create heatmap")
             return None
-    
-    # Find all video.mp4 files for this display
-    video_files = []
-    for chunk_dir in sorted([d for d in os.listdir(timeline.session_dir) if d.startswith('chunk_')]):
-        chunk_path = os.path.join(timeline.session_dir, chunk_dir)
-        if not os.path.isdir(chunk_path):
-            continue
-            
-        display_dir_prefix = f"display_{display_id}_"
-        display_dirs = [d for d in os.listdir(chunk_path) if os.path.isdir(os.path.join(chunk_path, d)) and d.startswith(display_dir_prefix)]
         
-        if not display_dirs:
-            continue
-            
-        display_dir = display_dirs[0]
-        video_path = os.path.join(chunk_path, display_dir, "video.mp4")
-        if os.path.exists(video_path):
-            video_files.append(video_path)
-    
-    if not video_files:
-        print(f"No video files found for display {display_id}")
-        return None
+        # Get dimensions from the first frame
+        first_frame = frame_events[0].pixels
+        height, width = first_frame.shape[0], first_frame.shape[1]
+        grid_height = height // PATCH_SIZE
+        grid_width = width // PATCH_SIZE
         
-    # Get mouse and keypress events
-    mouse_events = [e for e in events if e.event_type == "mouse"]
-    keypress_events = [e for e in events if e.event_type == "keypress"]
-    
-    # Create video writer
-    if not video_files:
-        print(f"No video files found for display {display_id}")
-        return None
+        # Create a heatmap matrix
+        heatmap = np.zeros((grid_height, grid_width))
         
-    # Start with the first video to get dimensions
-    cap = cv2.VideoCapture(video_files[0])
-    if not cap.isOpened():
-        print(f"Failed to open video file {video_files[0]}")
-        return None
+        # Fill the heatmap from the analytics data
+        patch_activity = self.patching_analytics.get('patch_activity_heatmap', {})
+        for (x, y), count in patch_activity.items():
+            if 0 <= x < grid_width and 0 <= y < grid_height:
+                heatmap[y, x] = count
         
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-    
-    # Create video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, output_fps, (width, height))
-    
-    # Since we have multiple video files, we need to track frame timestamps
-    frame_timestamps = []
-    for i, event in enumerate(frame_events):
-        frame_timestamps.append(event.monotonic_time)
+        # Plot the heatmap
+        plt.figure(figsize=(12, 10))
+        plt.imshow(heatmap, cmap='hot', interpolation='nearest')
+        plt.colorbar(label='Patch Activity Count')
+        plt.title('Patch Activity Heatmap')
+        plt.xlabel('X Grid Position')
+        plt.ylabel('Y Grid Position')
+        plt.savefig(output_path)
+        plt.close()
         
-    # Sort frame events by timestamp
-    frame_events.sort(key=lambda x: x.monotonic_time)
-    
-    # Limit to max frames if specified
-    if max_frames is not None and max_frames > 0 and len(frame_events) > max_frames:
-        print(f"Limiting to first {max_frames} frames (out of {len(frame_events)} total)")
-        frame_events = frame_events[:max_frames]
-    
-    # Process mouse and keypress events
-    mouse_idx = 0
-    keypress_idx = 0
-    last_mouse_pos = None
-    last_key_info = {'key_code': None, 'action': None, 'modifiers': []}
-    is_button_pressed = False
-    
-    # Keep track of pressed modifier keys
-    active_modifiers = set()
-    
-    # Track drag state
-    is_dragging = False
-    
-    # Process frames
-    for frame_idx, frame_event in enumerate(frame_events):
-        # Determine which video file we need to read from
-        video_idx = frame_idx // len(frame_events) * len(video_files)
-        if video_idx >= len(video_files):
-            video_idx = len(video_files) - 1
-            
-        cap = cv2.VideoCapture(video_files[video_idx])
-        if not cap.isOpened():
-            print(f"Failed to open video file {video_files[video_idx]}")
-            continue
-            
-        # Seek to the right frame (approximate)
-        frames_per_file = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        rel_frame_idx = frame_idx % frames_per_file
-        cap.set(cv2.CAP_PROP_POS_FRAMES, rel_frame_idx)
-        
-        ret, frame = cap.read()
-        if not ret:
-            print(f"Failed to read frame {rel_frame_idx} from {video_files[video_idx]}")
-            cap.release()
-            continue
-            
-        cap.release()
-        
-        # Get timestamp for this frame
-        current_ts = frame_event.monotonic_time
-        
-        # Format timestamp for display
-        dt = datetime.fromtimestamp(current_ts / 1000)
-        formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]  # Include milliseconds
-        
-        # Process all mouse events up to this frame's timestamp
-        while mouse_idx < len(mouse_events):
-            mouse_event = mouse_events[mouse_idx]
-            if mouse_event.monotonic_time > current_ts:
-                break
-                
-            # Update mouse position based on event type
-            if mouse_event.data.action == 'move':
-                last_mouse_pos = (mouse_event.data.x, mouse_event.data.y)
-            elif mouse_event.data.action == 'down':
-                is_button_pressed = True
-                if mouse_event.data.button == 0:  # Left button
-                    is_dragging = True
-            elif mouse_event.data.action == 'up':
-                is_button_pressed = False
-                if mouse_event.data.button == 0:  # Left button
-                    is_dragging = False
-                    
-            mouse_idx += 1
-            
-        # Process all keypress events up to this frame's timestamp
-        while keypress_idx < len(keypress_events):
-            keypress_event = keypress_events[keypress_idx]
-            if keypress_event.monotonic_time > current_ts:
-                break
-                
-            # Update key information
-            last_key_info = {
-                'key_code': keypress_event.data.key_code,
-                'action': keypress_event.data.action,
-                'modifiers': keypress_event.data.modifiers or []
-            }
-            
-            # Update active modifiers
-            if keypress_event.data.modifiers:
-                if keypress_event.data.action == 'down':
-                    for mod in keypress_event.data.modifiers:
-                        active_modifiers.add(mod)
-                elif keypress_event.data.action == 'up':
-                    for mod in keypress_event.data.modifiers:
-                        if mod in active_modifiers:
-                            active_modifiers.remove(mod)
-                            
-            keypress_idx += 1
-            
-        # Create frame copy for overlay
-        overlay_frame = frame.copy()
-        
-        # Draw mouse cursor if we have a position
-        if last_mouse_pos:
-            # Convert global coordinates to local video coordinates
-            gx, gy = last_mouse_pos
-            
-            # Convert from global to display-local
-            local_x = gx - display_data["x"]
-            local_y = gy - display_data["y"]
-            
-            # Scale to match video dimensions
-            scaled_x = int(local_x * display_data["capture_width"] / display_data["original_width"])
-            scaled_y = int(local_y * display_data["capture_height"] / display_data["original_height"])
-            
-            # Draw mouse cursor
-            if 0 <= scaled_x < width and 0 <= scaled_y < height:
-                if is_button_pressed:
-                    # Filled circle for mouse button down
-                    cv2.circle(overlay_frame, (scaled_x, scaled_y), 8, (0, 0, 255), -1)
-                else:
-                    # Hollow circle for normal cursor
-                    cv2.circle(overlay_frame, (scaled_x, scaled_y), 8, (0, 0, 255), 2)
-                    cv2.circle(overlay_frame, (scaled_x, scaled_y), 2, (0, 0, 255), -1)
-                    
-                # Add position text
-                pos_text = f"({scaled_x}, {scaled_y})"
-                cv2.putText(
-                    overlay_frame,
-                    pos_text,
-                    (scaled_x + 15, scaled_y + 25),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2
-                )
-        
-        # Draw key information
-        mods_str = '+'.join(active_modifiers) if active_modifiers else "none"
-        key_str = f"Key: {last_key_info['key_code']} ({last_key_info['action']}), Mods: {mods_str}"
-        cv2.putText(
-            overlay_frame,
-            key_str,
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (255, 255, 255),
-            2
-        )
-        
-        # Draw timestamp
-        cv2.putText(
-            overlay_frame,
-            f"Time: {formatted_time}",
-            (20, height - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2
-        )
-        
-        # Draw display info
-        cv2.putText(
-            overlay_frame,
-            f"Display: {display_data['title']} (ID: {display_id})",
-            (width - 400, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2
-        )
-        
-        # Write frame to output
-        out.write(overlay_frame)
-        
-    # Release resources
-    out.release()
-    
-    print(f"Timeline visualization rendered to {output_path}")
-    return output_path
+        logger.info(f"Patch activity heatmap saved to {output_path}")
+        return output_path
 
-if __name__ == "__main__":
-    import sys
-    import argparse
-    from collections import Counter
-    import math
-    import cv2
-    import os
-    
-    parser = argparse.ArgumentParser(description='Process loggy3 session data into a timeline.')
-    parser.add_argument('session_dir', help='Path to the session directory')
-    parser.add_argument('--visualize', '-v', action='store_true', help='Visualize timeline in terminal')
-    parser.add_argument('--width', '-w', type=int, default=120, help='Width of visualization (default: 120 chars)')
-    parser.add_argument('--sample-count', '-s', type=int, default=1000, help='Number of samples for visualization (default: 1000)')
-    parser.add_argument('--export', '-e', type=str, help='Export timeline to JSON file for training')
-    parser.add_argument('--sequences', type=str, help='Export timeline as sequences for model training')
-    parser.add_argument('--seq-length', type=int, default=100, help='Length of sequences for training (default: 100)')
-    parser.add_argument('--stride', type=int, default=10, help='Stride between sequences (default: 10)')
-    parser.add_argument('--render', type=str, help='Render timeline visualization to video file')
-    parser.add_argument('--display-id', type=int, help='Render only the specified display ID')
-    parser.add_argument('--output-fps', type=int, default=30, help='FPS for rendered video (default: 30)')
-    parser.add_argument('--start-time', type=int, help='Start time for rendering (in ms)')
-    parser.add_argument('--end-time', type=int, help='End time for rendering (in ms)')
-    parser.add_argument('--max-frames', type=int, help='Maximum number of frames to render')
-    args = parser.parse_args()
-    
-    timeline = Timeline(args.session_dir)
-    
-    print(f"Loaded {len(timeline)} events")
-    
-    # Print breakdown by event type
-    frame_events = timeline.get_events_by_type("frame")
-    keypress_events = timeline.get_events_by_type("keypress")
-    mouse_events = timeline.get_events_by_type("mouse")
-    
-    print(f"Frame events: {len(frame_events)}")
-    print(f"Keypress events: {len(keypress_events)}")
-    print(f"Mouse events: {len(mouse_events)}")
-    
-    # Export for model training if requested
-    if args.export:
-        timeline.export_for_training(args.export)
+    def print_analytics(self, save_plots=False):
+        """
+        Print comprehensive analytics about the timeline data to help identify issues
+        and understand the structure of the data.
         
-    # Export as sequences if requested
-    if args.sequences:
-        sequences = timeline.create_sequence_dataset(args.seq_length, args.stride)
-        with open(args.sequences, 'w') as f:
-            json.dump(sequences, f)
-        print(f"Exported {len(sequences)} sequences to {args.sequences}")
-        
-    # Render video visualization if requested
-    if args.render:
-        output_path = args.render
-        render_timeline_to_video(
-            timeline, 
-            output_path, 
-            display_id=args.display_id,
-            start_time=args.start_time,
-            end_time=args.end_time,
-            output_fps=args.output_fps,
-            max_frames=args.max_frames
-        )
-    
-    # Print sample of each event type
-    if frame_events:
-        print("\nSample frame event:")
-        print(f"  Type: frame")
-        print(f"  Time: {frame_events[0].monotonic_time}")
-        print(f"  Display ID: {frame_events[0].data.display_id}")
-        
-    if keypress_events:
-        print("\nSample keypress event:")
-        print(f"  Type: keypress")
-        print(f"  Time: {keypress_events[0].monotonic_time}")
-        print(f"  Action: {keypress_events[0].data.action}")
-        print(f"  Key code: {keypress_events[0].data.key_code}")
-        print(f"  Modifiers: {keypress_events[0].data.modifiers}")
-        
-    if mouse_events:
-        print("\nSample mouse event:")
-        print(f"  Type: mouse")
-        print(f"  Time: {mouse_events[0].monotonic_time}")
-        print(f"  Action: {mouse_events[0].data.action}")
-        print(f"  Position: ({mouse_events[0].data.x}, {mouse_events[0].data.y})")
-        if mouse_events[0].data.delta_x is not None or mouse_events[0].data.delta_y is not None:
-            print(f"  Delta: ({mouse_events[0].data.delta_x}, {mouse_events[0].data.delta_y})")
-    
-    # CLI visualization of the timeline
-    if args.visualize and timeline.events:
-        print("\nTimeline Visualization:")
-        print("-" * args.width)
-        
-        # Determine the time range
-        start_time = min(event.monotonic_time for event in timeline.events)
-        end_time = max(event.monotonic_time for event in timeline.events)
-        time_range = end_time - start_time
-        
-        # Get even sample distribution across the timeline
-        sample_indices = [int(i * (len(timeline.events) - 1) / (args.sample_count - 1)) for i in range(args.sample_count)]
-        sampled_events = [timeline.events[i] for i in sample_indices]
-        
-        # Visualization characters for each event type
-        vis_chars = {
-            "frame": "█",  # Frame events (filled block)
-            "keypress": "▲",  # Keypress events (triangle)
-            "mouse": "●"   # Mouse events (circle)
+        Args:
+            save_plots: If True, save plots to the output directory
+        """
+        # Define colors for better readability
+        COLORS = {
+            'header': '\033[1;36m',  # Cyan, bold
+            'subheader': '\033[1;34m',  # Blue, bold
+            'normal': '\033[0m',  # Reset
+            'value': '\033[1;32m',  # Green, bold
+            'warning': '\033[1;31m',  # Red, bold
+            'highlight': '\033[1;33m',  # Yellow, bold
+            'section': '\033[1;35m',  # Magenta, bold
+            'percent': '\033[1;96m',  # Bright cyan, bold
         }
         
-        # Group events by time slot
-        num_slots = args.width
-        slots = [[] for _ in range(num_slots)]
+        print(f"\n{COLORS['header']}{'='*80}{COLORS['normal']}")
+        print(f"{COLORS['header']}TIMELINE ANALYTICS REPORT{COLORS['normal']}")
+        print(f"{COLORS['header']}{'='*80}{COLORS['normal']}")
+        print(f"{COLORS['header']}Output directory: {self.output_dir}{COLORS['normal']}")
         
-        for event in sampled_events:
-            # Determine which slot this event belongs to
-            relative_time = event.monotonic_time - start_time
-            slot_idx = min(int((relative_time / time_range) * num_slots), num_slots - 1)
-            slots[slot_idx].append(event)
+        # Basic statistics
+        total_events = len(self.events)
+        total_timeline_events = len(self.timeline_events)
+        print(f"\n{COLORS['section']}1. BASIC STATISTICS:{COLORS['normal']}")
+        print(f"   Total timeline events: {COLORS['value']}{total_timeline_events}{COLORS['normal']}")
+        print(f"   Total computer events: {COLORS['value']}{total_events}{COLORS['normal']}")
         
-        # Create visualization line
-        visualization = ['·'] * num_slots  # Default is a dot for empty slots
+        # Count event types
+        event_types = Counter([type(event).__name__ for event in self.events])
+        timeline_event_types = Counter([type(event).__name__ for event in self.timeline_events])
         
-        for i, slot_events in enumerate(slots):
-            if not slot_events:
-                continue
-                
-            # Count event types in this slot
-            event_types = Counter(event.event_type for event in slot_events)
-            most_common = event_types.most_common(1)
-            if most_common:
-                most_common_type = most_common[0][0]
-                visualization[i] = vis_chars.get(most_common_type, '·')
+        print(f"\n{COLORS['section']}2. EVENT TYPE DISTRIBUTION:{COLORS['normal']}")
+        print(f"{COLORS['subheader']}   Timeline Events:{COLORS['normal']}")
+        for event_type, count in timeline_event_types.most_common():
+            percentage = count/total_timeline_events*100
+            print(f"   - {COLORS['highlight']}{event_type}{COLORS['normal']}: {COLORS['value']}{count}{COLORS['normal']} ({COLORS['percent']}{percentage:.1f}%{COLORS['normal']})")
         
-        # Print the visualization with legend
-        print(''.join(visualization))
-        print("-" * args.width)
-        print(f"Legend: {vis_chars['frame']} = Frame, {vis_chars['keypress']} = Keypress, {vis_chars['mouse']} = Mouse, · = Empty")
-        print(f"Time range: {start_time}ms - {end_time}ms ({(end_time - start_time) / 1000:.2f} seconds)")
+        print(f"\n{COLORS['subheader']}   Computer Events:{COLORS['normal']}")
+        for event_type, count in event_types.most_common():
+            percentage = count/total_events*100
+            print(f"   - {COLORS['highlight']}{event_type}{COLORS['normal']}: {COLORS['value']}{count}{COLORS['normal']} ({COLORS['percent']}{percentage:.1f}%{COLORS['normal']})")
         
-        # Print event density graph by type
-        print("\nEvent Density:")
-        max_count = max(len(slot) for slot in slots) if slots else 0
-        if max_count > 0:
-            scale_factor = min(10, max_count)  # Scale to a maximum of 10 rows
+        # Add patching analytics section
+        print(f"\n{COLORS['section']}3. PATCHING ANALYTICS:{COLORS['normal']}")
+        if self.patching_analytics:
+            frame_count = self.patching_analytics.get('frame_count', 0)
+            total_patches = self.patching_analytics.get('total_patches', 0)
+            active_patches_per_frame = self.patching_analytics.get('active_patches_per_frame', [])
             
-            for event_type, char in vis_chars.items():
-                densities = []
-                for slot in slots:
-                    count = sum(1 for event in slot if event.event_type == event_type)
-                    scaled_count = math.ceil((count / max_count) * scale_factor) if max_count > 0 else 0
-                    densities.append(scaled_count)
+            print(f"   Total frames processed: {COLORS['value']}{frame_count}{COLORS['normal']}")
+            print(f"   Total active patches: {COLORS['value']}{total_patches}{COLORS['normal']}")
+            
+            if frame_count > 0:
+                avg_patches = total_patches / frame_count
+                print(f"   Average active patches per frame: {COLORS['value']}{avg_patches:.2f}{COLORS['normal']}")
                 
-                # Print event type name and its density graph
-                print(f"{event_type.ljust(10)}: ", end="")
-                for d in densities:
-                    print(char * d, end="")
-                print()
+                # Get first frame for compression ratio calculation
+                frame_events = [event for event in self.timeline_events if isinstance(event, FrameEvent)]
+                if frame_events:
+                    first_frame = frame_events[0].pixels
+                    print(f"   Compression ratio (patches/total): {COLORS['value']}{avg_patches/(frame_count * (first_frame.shape[0] // PATCH_SIZE) * (first_frame.shape[1] // PATCH_SIZE)):.4f}{COLORS['normal']}")
+            
+            if active_patches_per_frame:
+                print(f"   Min active patches in a frame: {COLORS['value']}{min(active_patches_per_frame)}{COLORS['normal']}")
+                print(f"   Max active patches in a frame: {COLORS['value']}{max(active_patches_per_frame)}{COLORS['normal']}")
+                
+                # Plot histogram of active patches per frame
+                if save_plots:
+                    plt.figure(figsize=(10, 6))
+                    plt.hist(active_patches_per_frame, bins=50)
+                    plt.yscale('log')
+                    plt.title('Distribution of Active Patches per Frame')
+                    plt.xlabel('Number of Active Patches')
+                    plt.ylabel('Frequency')
+                    histogram_path = os.path.join(self.output_dir, 'active_patches_histogram.png')
+                    plt.savefig(histogram_path)
+                    plt.close()
+                    print(f"   Active patches histogram saved to {COLORS['highlight']}{os.path.basename(histogram_path)}{COLORS['normal']}")
+                
+                # Generate patch activity heatmap
+                if save_plots:
+                    heatmap_path = self.generate_patch_heatmap()
+                    if heatmap_path:
+                        print(f"   Patch activity heatmap saved to {COLORS['highlight']}{os.path.basename(heatmap_path)}{COLORS['normal']}")
+            
+            # Render reconstructed video if requested
+            if save_plots:
+                video_path = self.render_reconstructed_video(highlight_active=True)
+                if video_path:
+                    print(f"   Reconstructed video saved to {COLORS['highlight']}{os.path.basename(video_path)}{COLORS['normal']} (with orange overlay on active patches)")
+        else:
+            print(f"   {COLORS['warning']}No patching analytics available{COLORS['normal']}")
         
-        # Print timeline analytics
-        if timeline.events:
-            # Calculate events per second
-            total_duration_sec = time_range / 1000
-            if total_duration_sec > 0:
-                frames_per_sec = len(frame_events) / total_duration_sec
-                keypresses_per_sec = len(keypress_events) / total_duration_sec
-                mouse_events_per_sec = len(mouse_events) / total_duration_sec
-                
-                print(f"\nAnalytics (per second):")
-                print(f"Frames: {frames_per_sec:.2f}/s")
-                print(f"Keypresses: {keypresses_per_sec:.2f}/s")
-                print(f"Mouse events: {mouse_events_per_sec:.2f}/s")
-                
-            # Calculate time between consecutive events of the same type
-            if len(frame_events) > 1:
-                frame_intervals = [frame_events[i+1].monotonic_time - frame_events[i].monotonic_time 
-                                 for i in range(len(frame_events)-1)]
-                avg_frame_interval = sum(frame_intervals) / len(frame_intervals)
-                print(f"Average time between frames: {avg_frame_interval:.2f}ms ({1000/avg_frame_interval:.2f} fps)")
+        # Time analysis
+        if self.timeline_events:
+            start_time = min(event.time for event in self.timeline_events)
+            end_time = max(event.time for event in self.timeline_events)
+            duration_ms = end_time - start_time
             
-            # If we have displays, show them
-            display_ids = set()
-            for event in frame_events:
-                if isinstance(event.data, FrameEvent):
-                    display_ids.add(event.data.display_id)
+            print(f"\n{COLORS['section']}4. TIMELINE DURATION:{COLORS['normal']}")
+            print(f"   Start time: {COLORS['value']}{start_time}{COLORS['normal']} ms")
+            print(f"   End time: {COLORS['value']}{end_time}{COLORS['normal']} ms")
+            print(f"   Duration: {COLORS['value']}{duration_ms}{COLORS['normal']} ms ({COLORS['highlight']}{timedelta(milliseconds=duration_ms)}{COLORS['normal']})")
             
-            if display_ids:
-                print(f"\nDisplays detected: {len(display_ids)}")
-                for display_id in display_ids:
-                    display_frames = timeline.get_frame_events_for_display(display_id)
-                    print(f"  Display {display_id}: {len(display_frames)} frames")
+            # Analyze time gaps
+            time_sorted = sorted(self.timeline_events, key=lambda x: x.time)
+            time_gaps = [time_sorted[i+1].time - time_sorted[i].time for i in range(len(time_sorted)-1)]
+            
+            if time_gaps:
+                print(f"\n{COLORS['section']}5. TIME GAP ANALYSIS:{COLORS['normal']}")
+                print(f"   Min gap: {COLORS['value']}{min(time_gaps)}{COLORS['normal']} ms")
+                print(f"   Max gap: {COLORS['value']}{max(time_gaps)}{COLORS['normal']} ms")
+                print(f"   Mean gap: {COLORS['value']}{sum(time_gaps)/len(time_gaps):.2f}{COLORS['normal']} ms")
+                print(f"   Median gap: {COLORS['value']}{sorted(time_gaps)[len(time_gaps)//2]}{COLORS['normal']} ms")
+                
+                # Identify large gaps
+                large_gaps = [(i, gap) for i, gap in enumerate(time_gaps) if gap > 1000]  # gaps > 1 second
+                if large_gaps:
+                    print(f"   Found {COLORS['warning']}{len(large_gaps)}{COLORS['normal']} large gaps (>1000ms):")
+                    for i, (idx, gap) in enumerate(large_gaps[:5]):  # Show first 5 large gaps
+                        event_before = time_sorted[idx]
+                        event_after = time_sorted[idx+1]
+                        print(f"     Gap {i+1}: {COLORS['warning']}{gap}{COLORS['normal']} ms between {COLORS['highlight']}{type(event_before).__name__}{COLORS['normal']} and {COLORS['highlight']}{type(event_after).__name__}{COLORS['normal']}")
+                    if len(large_gaps) > 5:
+                        print(f"     ... and {COLORS['warning']}{len(large_gaps)-5}{COLORS['normal']} more large gaps")
+        
+        # Sequence analysis
+        seq_values = [event.seq for event in self.events]
+        if seq_values:
+            print(f"\n{COLORS['section']}6. SEQUENCE ANALYSIS:{COLORS['normal']}")
+            print(f"   Min seq: {COLORS['value']}{min(seq_values)}{COLORS['normal']}")
+            print(f"   Max seq: {COLORS['value']}{max(seq_values)}{COLORS['normal']}")
+            
+            # Check for sequence gaps
+            seq_sorted = sorted(seq_values)
+            expected_range = set(range(min(seq_sorted), max(seq_sorted) + 1))
+            missing_seq = expected_range - set(seq_sorted)
+            if missing_seq:
+                print(f"   Missing {COLORS['warning']}{len(missing_seq)}{COLORS['normal']} sequence numbers")
+                if len(missing_seq) < 10:
+                    print(f"   Missing sequences: {COLORS['warning']}{sorted(missing_seq)}{COLORS['normal']}")
+                else:
+                    print(f"   First 10 missing sequences: {COLORS['warning']}{sorted(list(missing_seq))[:10]}{COLORS['normal']}")
+            
+            # Check for duplicate sequences
+            seq_counts = Counter(seq_values)
+            duplicates = {seq: count for seq, count in seq_counts.items() if count > 1}
+            if duplicates:
+                print(f"   Found {COLORS['warning']}{len(duplicates)}{COLORS['normal']} duplicate sequence numbers")
+                if len(duplicates) < 10:
+                    for seq, count in sorted(duplicates.items()):
+                        print(f"     Seq {COLORS['highlight']}{seq}{COLORS['normal']} appears {COLORS['warning']}{count}{COLORS['normal']} times")
+                else:
+                    print(f"   First 10 duplicates: {COLORS['warning']}{dict(sorted(duplicates.items())[:10])}{COLORS['normal']}")
+        
+        # Duration analysis
+        # Separate analysis for PatchEvents and non-PatchEvents
+        patch_events_dur = [event.dur for event in self.events if isinstance(event, PatchEvent)]
+        non_patch_events_dur = [event.dur for event in self.events if not isinstance(event, PatchEvent)]
+        
+        print(f"\n{COLORS['section']}7. DURATION ANALYSIS:{COLORS['normal']}")
+        
+        # PatchEvents duration analysis
+        if patch_events_dur:
+            print(f"\n{COLORS['subheader']}   7.1 PATCH EVENTS DURATION:{COLORS['normal']}")
+            print(f"      Total patch events: {COLORS['value']}{len(patch_events_dur)}{COLORS['normal']}")
+            print(f"      Min dur: {COLORS['value']}{min(patch_events_dur):.6f}{COLORS['normal']}")
+            print(f"      Max dur: {COLORS['value']}{max(patch_events_dur):.6f}{COLORS['normal']}")
+            print(f"      Mean dur: {COLORS['value']}{sum(patch_events_dur)/len(patch_events_dur):.6f}{COLORS['normal']}")
+            
+            # Check for constant durations
+            dur_counts = Counter([round(d, 6) for d in patch_events_dur])
+            most_common_dur = dur_counts.most_common(1)[0]
+            percentage = most_common_dur[1]/len(patch_events_dur)*100
+            print(f"      Most common dur: {COLORS['value']}{most_common_dur[0]:.6f}{COLORS['normal']} (appears {COLORS['highlight']}{most_common_dur[1]}{COLORS['normal']} times, {COLORS['percent']}{percentage:.1f}%{COLORS['normal']})")
+            
+            if most_common_dur[1] / len(patch_events_dur) > 0.5:
+                print(f"      {COLORS['warning']}WARNING: Duration values appear to be constant for {percentage:.1f}% of patch events{COLORS['normal']}")
+            
+            # Histogram of durations
+            if save_plots:
+                plt.figure(figsize=(10, 6))
+                plt.hist(patch_events_dur, bins=50)
+                plt.title('Distribution of Duration Values - Patch Events')
+                plt.xlabel('Duration')
+                plt.ylabel('Count')
+                plt.savefig(os.path.join(self.output_dir, 'patch_events_duration_histogram.png'))
+                plt.close()
+        
+        # Non-PatchEvents duration analysis
+        if non_patch_events_dur:
+            print(f"\n{COLORS['subheader']}   7.2 NON-PATCH EVENTS DURATION:{COLORS['normal']}")
+            print(f"      Total non-patch events: {COLORS['value']}{len(non_patch_events_dur)}{COLORS['normal']}")
+            print(f"      Min dur: {COLORS['value']}{min(non_patch_events_dur):.6f}{COLORS['normal']}")
+            print(f"      Max dur: {COLORS['value']}{max(non_patch_events_dur):.6f}{COLORS['normal']}")
+            print(f"      Mean dur: {COLORS['value']}{sum(non_patch_events_dur)/len(non_patch_events_dur):.6f}{COLORS['normal']}")
+            
+            # Check for constant durations
+            dur_counts = Counter([round(d, 6) for d in non_patch_events_dur])
+            most_common_dur = dur_counts.most_common(1)[0]
+            percentage = most_common_dur[1]/len(non_patch_events_dur)*100
+            print(f"      Most common dur: {COLORS['value']}{most_common_dur[0]:.6f}{COLORS['normal']} (appears {COLORS['highlight']}{most_common_dur[1]}{COLORS['normal']} times, {COLORS['percent']}{percentage:.1f}%{COLORS['normal']})")
+            
+            if most_common_dur[1] / len(non_patch_events_dur) > 0.5:
+                print(f"      {COLORS['warning']}WARNING: Duration values appear to be constant for {percentage:.1f}% of non-patch events{COLORS['normal']}")
+            
+            # Histogram of durations
+            if save_plots:
+                plt.figure(figsize=(10, 6))
+                plt.hist(non_patch_events_dur, bins=50)
+                plt.title('Distribution of Duration Values - Non-Patch Events')
+                plt.xlabel('Duration')
+                plt.ylabel('Count')
+                plt.savefig(os.path.join(self.output_dir, 'non_patch_events_duration_histogram.png'))
+                plt.close()
+        
+        # Event-specific analysis
+        
+        # PatchEvent analysis
+        patch_events = [event for event in self.events if isinstance(event, PatchEvent)]
+        if patch_events:
+            print(f"\n{COLORS['section']}8. PATCH EVENT ANALYSIS:{COLORS['normal']}")
+            print(f"   Total patch events: {COLORS['value']}{len(patch_events)}{COLORS['normal']}")
+            
+            # Check grid positions
+            grid_x_values = [event.grid_x for event in patch_events]
+            grid_y_values = [event.grid_y for event in patch_events]
+            
+            grid_x_counts = Counter(grid_x_values)
+            grid_y_counts = Counter(grid_y_values)
+            
+            print(f"   Unique grid_x values: {COLORS['value']}{len(grid_x_counts)}{COLORS['normal']}")
+            print(f"   Unique grid_y values: {COLORS['value']}{len(grid_y_counts)}{COLORS['normal']}")
+            
+            if len(grid_x_counts) == 1:
+                print(f"   {COLORS['warning']}WARNING: All grid_x values are constant ({list(grid_x_counts.keys())[0]}){COLORS['normal']}")
+            
+            if len(grid_y_counts) == 1:
+                print(f"   {COLORS['warning']}WARNING: All grid_y values are constant ({list(grid_y_counts.keys())[0]}){COLORS['normal']}")
+            
+            # Check frame dimensions
+            if patch_events:
+                frame_shapes = Counter([tuple(event.pixels.shape) for event in patch_events])
+                print(f"   Frame shapes: {COLORS['highlight']}{dict(frame_shapes)}{COLORS['normal']}")
+        
+        # MoveEvent analysis
+        move_events = [event for event in self.events if isinstance(event, MoveEvent)]
+        if move_events:
+            print(f"\n{COLORS['section']}9. MOVE EVENT ANALYSIS:{COLORS['normal']}")
+            print(f"   Total move events: {COLORS['value']}{len(move_events)}{COLORS['normal']}")
+            
+            delta_x_values = [event.delta_x for event in move_events]
+            delta_y_values = [event.delta_y for event in move_events]
+            
+            # Check for zero deltas
+            zero_delta_x = sum(1 for dx in delta_x_values if dx == 0)
+            zero_delta_y = sum(1 for dy in delta_y_values if dy == 0)
+            
+            x_percentage = zero_delta_x/len(move_events)*100
+            y_percentage = zero_delta_y/len(move_events)*100
+            
+            print(f"   Zero delta_x: {COLORS['value']}{zero_delta_x}{COLORS['normal']} ({COLORS['percent']}{x_percentage:.1f}%{COLORS['normal']})")
+            print(f"   Zero delta_y: {COLORS['value']}{zero_delta_y}{COLORS['normal']} ({COLORS['percent']}{y_percentage:.1f}%{COLORS['normal']})")
+            
+            if zero_delta_x / len(move_events) > 0.9:
+                print(f"   {COLORS['warning']}WARNING: delta_x is zero for {x_percentage:.1f}% of move events{COLORS['normal']}")
+            
+            if zero_delta_y / len(move_events) > 0.9:
+                print(f"   {COLORS['warning']}WARNING: delta_y is zero for {y_percentage:.1f}% of move events{COLORS['normal']}")
+            
+            # Statistics on deltas
+            if delta_x_values:
+                print(f"   delta_x - min: {COLORS['value']}{min(delta_x_values):.2f}{COLORS['normal']}, max: {COLORS['value']}{max(delta_x_values):.2f}{COLORS['normal']}, mean: {COLORS['value']}{sum(delta_x_values)/len(delta_x_values):.2f}{COLORS['normal']}")
+            
+            if delta_y_values:
+                print(f"   delta_y - min: {COLORS['value']}{min(delta_y_values):.2f}{COLORS['normal']}, max: {COLORS['value']}{max(delta_y_values):.2f}{COLORS['normal']}, mean: {COLORS['value']}{sum(delta_y_values)/len(delta_y_values):.2f}{COLORS['normal']}")
+            
+            # Reconstruct mouse path
+            if move_events and save_plots:
+                x_pos, y_pos = 0.0, 0.0
+                positions_x, positions_y = [x_pos], [y_pos]
+                
+                for event in move_events:
+                    x_pos += event.delta_x
+                    y_pos += event.delta_y
+                    positions_x.append(x_pos)
+                    positions_y.append(y_pos)
+                
+                plt.figure(figsize=(10, 10))
+                plt.plot(positions_x, positions_y, 'b-', alpha=0.5)
+                plt.scatter(positions_x[0], positions_y[0], color='green', s=100, label='Start')
+                plt.scatter(positions_x[-1], positions_y[-1], color='red', s=100, label='End')
+                plt.title('Reconstructed Mouse Path')
+                plt.xlabel('X Position')
+                plt.ylabel('Y Position')
+                plt.legend()
+                plt.grid(True)
+                plt.savefig(os.path.join(self.output_dir, 'mouse_path.png'))
+                plt.close()
+        
+        # ScrollEvent analysis
+        scroll_events = [event for event in self.events if isinstance(event, ScrollEvent)]
+        if scroll_events:
+            print(f"\n{COLORS['section']}10. SCROLL EVENT ANALYSIS:{COLORS['normal']}")
+            print(f"   Total scroll events: {COLORS['value']}{len(scroll_events)}{COLORS['normal']}")
+            
+            scroll_x_values = [event.scroll_x for event in scroll_events]
+            scroll_y_values = [event.scroll_y for event in scroll_events]
+            
+            # Check for zero scrolls
+            zero_scroll_x = sum(1 for sx in scroll_x_values if sx == 0)
+            zero_scroll_y = sum(1 for sy in scroll_y_values if sy == 0)
+            
+            x_percentage = zero_scroll_x/len(scroll_events)*100
+            y_percentage = zero_scroll_y/len(scroll_events)*100
+            
+            print(f"   Zero scroll_x: {COLORS['value']}{zero_scroll_x}{COLORS['normal']} ({COLORS['percent']}{x_percentage:.1f}%{COLORS['normal']})")
+            print(f"   Zero scroll_y: {COLORS['value']}{zero_scroll_y}{COLORS['normal']} ({COLORS['percent']}{y_percentage:.1f}%{COLORS['normal']})")
+            
+            if zero_scroll_x / len(scroll_events) > 0.9:
+                print(f"   {COLORS['warning']}WARNING: scroll_x is zero for {x_percentage:.1f}% of scroll events{COLORS['normal']}")
+            
+            if zero_scroll_y / len(scroll_events) > 0.9:
+                print(f"   {COLORS['warning']}WARNING: scroll_y is zero for {y_percentage:.1f}% of scroll events{COLORS['normal']}")
+            
+            # Statistics on scrolls
+            if scroll_x_values:
+                print(f"   scroll_x - min: {COLORS['value']}{min(scroll_x_values)}{COLORS['normal']}, max: {COLORS['value']}{max(scroll_x_values)}{COLORS['normal']}, mean: {COLORS['value']}{sum(scroll_x_values)/len(scroll_x_values):.2f}{COLORS['normal']}")
+            
+            if scroll_y_values:
+                print(f"   scroll_y - min: {COLORS['value']}{min(scroll_y_values)}{COLORS['normal']}, max: {COLORS['value']}{max(scroll_y_values)}{COLORS['normal']}, mean: {COLORS['value']}{sum(scroll_y_values)/len(scroll_y_values):.2f}{COLORS['normal']}")
+        
+        # PressEvent analysis
+        press_events = [event for event in self.events if isinstance(event, PressEvent)]
+        if press_events:
+            print(f"\n{COLORS['section']}11. PRESS EVENT ANALYSIS:{COLORS['normal']}")
+            print(f"   Total press events: {COLORS['value']}{len(press_events)}{COLORS['normal']}")
+            
+            # Count key codes
+            key_counts = Counter([event.key for event in press_events])
+            print(f"   Unique keys pressed: {COLORS['value']}{len(key_counts)}{COLORS['normal']}")
+            
+            # Show most common keys
+            print(f"{COLORS['subheader']}   Most common keys:{COLORS['normal']}")
+            for key, count in key_counts.most_common(10):
+                key_name = SPECIAL_KEYS_REVERSE.get(key, f"Key {key}")
+                print(f"     {COLORS['highlight']}{key_name}{COLORS['normal']}: {COLORS['value']}{count}{COLORS['normal']} times")
+            
+            # Check down/up balance
+            down_events = sum(1 for event in press_events if event.down)
+            up_events = sum(1 for event in press_events if not event.down)
+            
+            print(f"   Key down events: {COLORS['value']}{down_events}{COLORS['normal']}")
+            print(f"   Key up events: {COLORS['value']}{up_events}{COLORS['normal']}")
+            
+            if abs(down_events - up_events) > 5:
+                print(f"   {COLORS['warning']}WARNING: Imbalance between key down ({down_events}) and key up ({up_events}) events{COLORS['normal']}")
+            
+            # Check for key press sequences
+            key_sequence = [(event.key, event.down) for event in press_events]
+            key_state = {}
+            orphaned_ups = 0
+            orphaned_downs = 0
+            
+            for key, is_down in key_sequence:
+                if is_down:
+                    if key in key_state and key_state[key]:
+                        orphaned_downs += 1
+                    key_state[key] = True
+                else:
+                    if key not in key_state or not key_state[key]:
+                        orphaned_ups += 1
+                    key_state[key] = False
+            
+            # Check for keys still down at the end
+            keys_still_down = sum(1 for state in key_state.values() if state)
+            
+            if orphaned_downs > 0:
+                print(f"   {COLORS['warning']}WARNING: Found {orphaned_downs} orphaned key down events (no matching up event){COLORS['normal']}")
+            
+            if orphaned_ups > 0:
+                print(f"   {COLORS['warning']}WARNING: Found {orphaned_ups} orphaned key up events (no matching down event){COLORS['normal']}")
+            
+            if keys_still_down > 0:
+                print(f"   {COLORS['warning']}WARNING: {keys_still_down} keys still down at the end of the timeline{COLORS['normal']}")
+        
+        print(f"\n{COLORS['header']}{'='*80}{COLORS['normal']}")
+        print(f"{COLORS['header']}END OF ANALYTICS REPORT{COLORS['normal']}")
+        print(f"{COLORS['header']}{'='*80}{COLORS['normal']}\n")
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--chunk-dir", type=str, required=True)
+    parser.add_argument("--output-dir", type=str, help="Directory to save analysis outputs (default: ./data/{chunkname}_analysis)")
+    parser.add_argument("--save-plots", action="store_true", help="Save analytics plots to the output directory")
+    parser.add_argument("--no-highlight", action="store_true", help="Disable highlighting of active patches in the reconstructed video")
+    parser.add_argument("--highlight-color", type=str, default="orange", help="Color for highlighting active patches (orange, red, blue, yellow, cyan, magenta, green)")
+    parser.add_argument("--highlight-opacity", type=float, default=0.3, help="Opacity of the highlight overlay (0.0 to 1.0)")
+    args = parser.parse_args()
+    
+    # Map color names to BGR values (OpenCV uses BGR)
+    color_map = {
+        "orange": (0, 165, 255),
+        "red": (0, 0, 255),
+        "blue": (255, 0, 0),
+        "yellow": (0, 255, 255),
+        "cyan": (255, 255, 0),
+        "magenta": (255, 0, 255),
+        "green": (0, 255, 0)
+    }
+    highlight_color = color_map.get(args.highlight_color.lower(), (0, 165, 255))  # Default to orange
+    
+    timeline = Timeline(args.chunk_dir, args.output_dir)
+    
+    # If save_plots is enabled, render the video with or without highlighting based on args
+    if args.save_plots:
+        highlight_active = not args.no_highlight
+        video_path = timeline.render_reconstructed_video(
+            highlight_active=highlight_active,
+            highlight_color=highlight_color,
+            highlight_opacity=args.highlight_opacity
+        )
+        if video_path:
+            print(f"Reconstructed video saved to {video_path}" + 
+                  (" with active patch highlighting" if highlight_active else ""))
+    
+    timeline.print_analytics(save_plots=args.save_plots)

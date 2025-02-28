@@ -108,7 +108,7 @@ pub fn check_and_request_permissions() -> Result<(), &'static str> {
             println!("\n{}", "After enabling the permission, please restart this app.".bright_green());
             return Err("Input monitoring permission not granted");
         }
-        None => {
+        _ => {
             println!("{}", "🟡 Input Monitoring permission is not determined. Requesting now...".yellow());
             println!("{}", "If prompted, please click \"Allow\" to grant Input Monitoring permission.".bright_green().bold());
             
