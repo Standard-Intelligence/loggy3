@@ -56,6 +56,19 @@ else
     echo "✅ Created $BASHRC with PATH export"
 fi
 
+BASH_PROFILE="$HOME/.bash_profile"
+if [ -f "$BASH_PROFILE" ]; then
+    if ! grep -q "export PATH=\"$INSTALL_DIR:\$PATH\"" "$BASH_PROFILE"; then
+        echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$BASH_PROFILE"
+        echo "✅ Added PATH export to $BASH_PROFILE"
+    else
+        echo "✅ PATH already configured in $BASH_PROFILE"
+    fi
+else
+    echo "export PATH=\"$INSTALL_DIR:\$PATH\"" > "$BASH_PROFILE"
+    echo "✅ Created $BASH_PROFILE with PATH export"
+fi
+
 echo " "
 echo "🚀 Running $BINARY_NAME, in the future you can run 'loggy3' directly"
 "$INSTALL_DIR/$BINARY_NAME"
