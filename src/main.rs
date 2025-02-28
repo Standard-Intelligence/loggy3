@@ -1374,6 +1374,7 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
                         println!("{}", "✓ Update script created and started".green());
                         println!("{}", "The update will be applied when you close Loggy3.".bright_green().bold());
                         println!("{}", "Please close the application to complete the update.".bright_yellow());
+                        return Ok(());
                     },
                     Err(e) => {
                         return Err(anyhow::anyhow!("Failed to start update script: {}", e));
@@ -1384,50 +1385,44 @@ fn update_to_new_version(download_url: &str) -> Result<()> {
                 return Err(anyhow::anyhow!("Failed to create update script: {}", e));
             }
         }
-        
-        // Don't exit immediately on Windows, let the user close the app manually
-        return Ok(());
     }
     
     #[cfg(not(windows))]
-    if let Err(e) = std::fs::rename(&temp_path, &target_path) {
-        return Err(anyhow::anyhow!("Failed to install update: {}", e));
-    }
-    
-    // Double-check permissions after rename on Unix systems
-    #[cfg(unix)]
     {
-        if let Err(e) = std::process::Command::new("chmod")
-            .arg("+x")
-            .arg(&target_path)
-            .status() {
-                eprintln!("Warning: Failed to set executable permissions after rename: {}", e);
-                
-                // Fallback to Rust's permission system
-                use std::os::unix::fs::PermissionsExt;
-                match std::fs::metadata(&target_path) {
-                    Ok(meta) => {
-                        let mut perms = meta.permissions();
-                        perms.set_mode(0o755); // rwxr-xr-x
-                        if let Err(e) = std::fs::set_permissions(&target_path, perms) {
-                            eprintln!("Warning: Failed to set file permissions after rename: {}", e);
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("Warning: Failed to get file permissions after rename: {}", e);
-                    }
-                };
+        if let Err(e) = std::fs::rename(&temp_path, &target_path) {
+            return Err(anyhow::anyhow!("Failed to install update: {}", e));
         }
-    }
-    
-    #[cfg(not(windows))]
-    {
+        
+        // Double-check permissions after rename on Unix systems
+        #[cfg(unix)]
+        {
+            if let Err(e) = std::process::Command::new("chmod")
+                .arg("+x")
+                .arg(&target_path)
+                .status() {
+                    eprintln!("Warning: Failed to set executable permissions after rename: {}", e);
+                    
+                    // Fallback to Rust's permission system
+                    use std::os::unix::fs::PermissionsExt;
+                    match std::fs::metadata(&target_path) {
+                        Ok(meta) => {
+                            let mut perms = meta.permissions();
+                            perms.set_mode(0o755); // rwxr-xr-x
+                            if let Err(e) = std::fs::set_permissions(&target_path, perms) {
+                                eprintln!("Warning: Failed to set file permissions after rename: {}", e);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Warning: Failed to get file permissions after rename: {}", e);
+                        }
+                    };
+            }
+        }
+        
         println!("{}", "✓ Update installed successfully!".green());
         println!("{}", "Please restart loggy3 to use the new version.".bright_green().bold());
         exit(0);
     }
-    
-    Ok(())
 }
 
 
