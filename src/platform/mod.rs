@@ -70,11 +70,10 @@ impl LogWriterCache {
         let chunk_index = (timestamp_ms / 60000) as usize;
 
         let create_new_writer = || -> LogWriter {
-            let log_path = &self.session_dir
-                .join(format!("chunk_{:05}", chunk_index))
-                .join(format!("{}.log", log_type));
+            let chunk_dir = &self.session_dir.join(format!("chunk_{:05}", chunk_index));
+            let log_path = chunk_dir.join(format!("{}.log", log_type));
+            create_dir_all(&chunk_dir).unwrap();
             
-            create_dir_all(&log_path).unwrap();
             println!("{}", format!("Created new {} log for chunk {}", log_type, chunk_index).yellow());
 
             LogWriter {
