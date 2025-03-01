@@ -47,33 +47,47 @@ pub fn get_multi_timestamp() -> MultiTimestamp {
     MultiTimestamp { seq, wall_time, monotonic_time }
 }
 
+
+struct LogWriter {
+    file: File,
+    chunk_index: usize,
+}
+
 pub struct LogWriterCache {
     session_dir: PathBuf,
-    event_writers: HashMap<(usize, String), File>,
+    current_writers: HashMap<String, LogWriter>,
 }
 
 impl LogWriterCache {
     pub fn new(session_dir: PathBuf) -> Self {
         Self {
             session_dir,
-            event_writers: HashMap::new(),
+            current_writers: HashMap::new()
         }
     }
 
     fn get_writer(&mut self, timestamp_ms: u128, log_type: &str) -> Result<&mut File> {
         let chunk_index = (timestamp_ms / 60000) as usize;
-        let cache_key = (chunk_index, log_type.to_string());
-        
-        if !self.event_writers.contains_key(&cache_key) {
-            let chunk_dir = self.session_dir.join(format!("chunk_{:05}", chunk_index));
-            create_dir_all(&chunk_dir)?;
+
+        let create_new_writer = || -> LogWriter {
+            let log_path = &self.session_dir
+                .join(format!("chunk_{:05}", chunk_index))
+                .join(format!("{}.log", log_type));
             
-            let log_path = chunk_dir.join(format!("{}.log", log_type));
-            let writer = File::create(log_path)?;
+            create_dir_all(&log_path).unwrap();
             println!("{}", format!("Created new {} log for chunk {}", log_type, chunk_index).yellow());
-            self.event_writers.insert(cache_key.clone(), writer);
+
+            LogWriter {
+                file: File::create(log_path).unwrap(),
+                chunk_index
+            }
+        };
+
+        let logwriter = self.current_writers.entry(log_type.to_string()).or_insert_with(create_new_writer);
+        if logwriter.chunk_index != chunk_index {
+            *logwriter = create_new_writer();
         }
-        Ok(self.event_writers.get_mut(&cache_key).unwrap())
+        Ok(&mut logwriter.file)
     }
 }
 
