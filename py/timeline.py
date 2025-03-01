@@ -100,12 +100,6 @@ def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent
     mouse_pos = None
     screenstate = None
     
-    # Tracking variables for patching analytics
-    frame_count = 0
-    total_patches = 0
-    active_patches_per_frame = []
-    patch_activity_heatmap = defaultdict(int)
-    
     for i, event in enumerate(timeline_events):
         event_dur = 1.0
         if i < len(timeline_events) - 1:
@@ -114,10 +108,71 @@ def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent
                 event_dur = 1.0
         match event:
             case FrameEvent():
+                pixels = event.pixels.float()
+                assert pixels.shape[0] % PATCH_SIZE == 0 and pixels.shape[1] % PATCH_SIZE == 0, f"Pixels shape {pixels.shape} is not divisible by patch size {PATCH_SIZE}"
+                
+                grid_height = pixels.shape[0] // PATCH_SIZE
+                grid_width = pixels.shape[1] // PATCH_SIZE
+                
+                pixels = rearrange(pixels, "(h p1) (w p2) c -> (h w) p1 p2 c", p1=PATCH_SIZE, p2=PATCH_SIZE)
+                if screenstate is None:
+                    screenstate = T.zeros_like(pixels)
+                
+                state_diff = T.abs(pixels - screenstate).mean(dim=(1,2,3))
+                active_patches = state_diff > 10.0
+                active_patches_idx = T.nonzero(active_patches, as_tuple=False)
+                
+                for patch_idx in active_patches_idx:
+                    patch_idx_val = int(patch_idx.item())  # Convert tensor to int
+                    patch_y = patch_idx_val // grid_width
+                    patch_x = patch_idx_val % grid_width
+                    
+                    computer_events.append(PatchEvent(
+                        seq=event.seq, dur=event_dur, pixels=pixels[patch_idx_val], grid_x=int(patch_x), grid_y=int(patch_y)))
+                
+                screenstate = pixels
+            case PositionEvent():
+                if mouse_pos is None:
+                    mouse_pos = (event.x, event.y)
+                computer_events.append(MoveEvent(
+                    seq=event.seq, dur=event_dur, delta_x=event.x - mouse_pos[0], delta_y=event.y - mouse_pos[1]))
+                mouse_pos = (event.x, event.y)
+            case TimelineScrollEvent():
+                computer_events.append(ScrollEvent(
+                    seq=event.seq, dur=event_dur, scroll_x=event.scroll_x, scroll_y=event.scroll_y))
+            case TimelinePressEvent():
+                computer_events.append(PressEvent(
+                    seq=event.seq, dur=event_dur, key=event.key, down=event.down))
+    
+    return computer_events
+
+def collect_timeline_analytics(timeline_events: List[FrameEvent | PositionEvent | TimelineScrollEvent | TimelinePressEvent]) -> dict:
+    """
+    Collect analytics data from timeline events.
+    This function is separate from timeline_to_computer_events to keep the production code clean.
+    
+    Args:
+        timeline_events: List of timeline events
+        
+    Returns:
+        Dictionary containing analytics data
+    """
+    timeline_events = sorted(timeline_events, key=lambda x: x.seq)
+    mouse_pos = None
+    screenstate = None
+    
+    # Tracking variables for patching analytics
+    frame_count = 0
+    total_patches = 0
+    active_patches_per_frame = []
+    patch_activity_heatmap = defaultdict(int)
+    
+    for i, event in enumerate(timeline_events):
+        match event:
+            case FrameEvent():
                 frame_count += 1
                 pixels = event.pixels.float()
                 logger.debug(f"Processing frame {frame_count} with shape {pixels.shape}")
-                assert pixels.shape[0] % PATCH_SIZE == 0 and pixels.shape[1] % PATCH_SIZE == 0, f"Pixels shape {pixels.shape} is not divisible by patch size {PATCH_SIZE}"
                 
                 # Calculate grid dimensions for logging
                 grid_height = pixels.shape[0] // PATCH_SIZE
@@ -146,23 +201,8 @@ def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent
                     
                     # Update heatmap
                     patch_activity_heatmap[(patch_x, patch_y)] += 1
-                    
-                    computer_events.append(PatchEvent(
-                        seq=event.seq, dur=event_dur, pixels=pixels[patch_idx_val], grid_x=int(patch_x), grid_y=int(patch_y)))
                 
                 screenstate = pixels
-            case PositionEvent():
-                if mouse_pos is None:
-                    mouse_pos = (event.x, event.y)
-                computer_events.append(MoveEvent(
-                    seq=event.seq, dur=event_dur, delta_x=event.x - mouse_pos[0], delta_y=event.y - mouse_pos[1]))
-                mouse_pos = (event.x, event.y)
-            case TimelineScrollEvent():
-                computer_events.append(ScrollEvent(
-                    seq=event.seq, dur=event_dur, scroll_x=event.scroll_x, scroll_y=event.scroll_y))
-            case TimelinePressEvent():
-                computer_events.append(PressEvent(
-                    seq=event.seq, dur=event_dur, key=event.key, down=event.down))
     
     # Log summary statistics
     if frame_count > 0:
@@ -171,18 +211,15 @@ def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent
         if active_patches_per_frame:
             logger.info(f"Min active patches: {min(active_patches_per_frame)}, Max: {max(active_patches_per_frame)}")
     
-    # Store analytics data for later use
-    timeline_to_computer_events.analytics = {
+    return {
         'frame_count': frame_count,
         'total_patches': total_patches,
         'active_patches_per_frame': active_patches_per_frame,
         'patch_activity_heatmap': dict(patch_activity_heatmap)
     }
-    
-    return computer_events
 
 class Timeline:
-    def __init__(self, chunk_dir: str, output_dir: Optional[str] = None):
+    def __init__(self, chunk_dir: str, output_dir: Optional[str] = None, collect_analytics: bool = False):
         self.chunk_dir = chunk_dir
         
         # Set up output directory
@@ -200,8 +237,11 @@ class Timeline:
         
         self.timeline_events = self.load_chunk()
         self.events = timeline_to_computer_events(self.timeline_events)
-        # Store analytics data
-        self.patching_analytics = getattr(timeline_to_computer_events, 'analytics', {})
+        
+        # Collect analytics data if requested
+        self.patching_analytics = {}
+        if collect_analytics:
+            self.patching_analytics = collect_timeline_analytics(self.timeline_events)
 
     def load_chunk(self):
         display_dirs = [d for d in os.listdir(self.chunk_dir) 
@@ -890,7 +930,8 @@ if __name__ == "__main__":
     }
     highlight_color = color_map.get(args.highlight_color.lower(), (0, 165, 255))  # Default to orange
     
-    timeline = Timeline(args.chunk_dir, args.output_dir)
+    # Always collect analytics when running the script directly
+    timeline = Timeline(args.chunk_dir, args.output_dir, collect_analytics=True)
     
     # If save_plots is enabled, render the video with or without highlighting based on args
     if args.save_plots:
