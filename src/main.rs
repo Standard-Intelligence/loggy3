@@ -3,7 +3,6 @@ mod platform;
 use anyhow::{Context, Result};
 use chrono::Local;
 use colored::*;
-use ctrlc::set_handler;
 use dirs;
 use scap::{
     capturer::{Capturer, Options, Resolution},
@@ -18,7 +17,7 @@ use std::{
     process::{exit, Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, channel, Receiver, Sender},
+        mpsc::{self, Receiver, Sender},
         Arc, Mutex,
     },
     thread,
@@ -457,8 +456,6 @@ pub fn main() -> Result<()> {
 
         println!("{}", "Recording stopped. Thank you for using Loggy3!".green().bold());
     }
-    
-    Ok(())
 }
 fn get_display_fingerprint() -> String {
     let displays = platform::get_display_info();

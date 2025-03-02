@@ -13,6 +13,7 @@ from collections import Counter, defaultdict
 import matplotlib.pyplot as plt
 from datetime import timedelta
 import logging
+import argparse
 
 # Configure logging
 logging.basicConfig(
@@ -34,6 +35,8 @@ class FrameEvent(TimelineEvent):
 class PositionEvent(TimelineEvent):
     x: float # screen coordinates
     y: float
+    delta_x: float # raw mouse deltas
+    delta_y: float
     
 @dataclass
 class TimelineScrollEvent(TimelineEvent):
@@ -59,8 +62,11 @@ class PatchEvent(ComputerEvent):
 
 @dataclass
 class MoveEvent(ComputerEvent):
-    delta_x: float # screen coordinate deltas
+    delta_x: float # raw mouse deltas
     delta_y: float
+    pos_dx: float # screen coordinate deltas
+    pos_dy: float
+
 
 @dataclass
 class ScrollEvent(ComputerEvent):
@@ -148,7 +154,7 @@ def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent
                 if mouse_pos is None:
                     mouse_pos = (event.x, event.y)
                 computer_events.append(MoveEvent(
-                    seq=event.seq, dur=event_dur, delta_x=event.x - mouse_pos[0], delta_y=event.y - mouse_pos[1]))
+                    seq=event.seq, dur=event_dur, delta_x=event.delta_x, delta_y=event.delta_y, pos_dx=event.x - mouse_pos[0], pos_dy=event.y - mouse_pos[1]))
                 mouse_pos = (event.x, event.y)
             case TimelineScrollEvent():
                 computer_events.append(ScrollEvent(
@@ -251,10 +257,50 @@ class Timeline:
         self.timeline_events = self.load_chunk()
         self.events = timeline_to_computer_events(self.timeline_events)
         
+        # Detect video FPS
+        self.video_fps = self._detect_video_fps()
+        logger.info(f"Detected video FPS: {self.video_fps:.2f}")
+        
         # Collect analytics data if requested
         self.patching_analytics = {}
         if collect_analytics:
             self.patching_analytics = collect_timeline_analytics(self.timeline_events)
+
+    def _detect_video_fps(self) -> float:
+        """
+        Detect FPS from the original video file or calculate it from frame timings.
+        
+        Returns:
+            Detected FPS, or 30.0 if it cannot be determined
+        """
+        # Try to get FPS from video file metadata first
+        display_dirs = [d for d in os.listdir(self.chunk_dir) 
+                       if os.path.isdir(os.path.join(self.chunk_dir, d)) and d.startswith("display_")]
+        if display_dirs:
+            main_display_dir = os.path.join(self.chunk_dir, display_dirs[0])
+            video_path = os.path.join(main_display_dir, "video.mp4")
+            
+            if os.path.exists(video_path):
+                video = cv2.VideoCapture(video_path)
+                if video.isOpened():
+                    fps = video.get(cv2.CAP_PROP_FPS)
+                    video.release()
+                    if fps > 0:
+                        return fps
+        
+        # Fallback: Calculate FPS from frame event timing if available
+        frame_events = sorted([event for event in self.timeline_events if isinstance(event, FrameEvent)], 
+                             key=lambda x: x.seq)
+        
+        if len(frame_events) > 1:
+            frame_durations = [frame_events[i+1].time - frame_events[i].time 
+                              for i in range(len(frame_events)-1)]
+            avg_frame_duration_ms = sum(frame_durations) / len(frame_durations)
+            if avg_frame_duration_ms > 0:
+                return 1000 / avg_frame_duration_ms
+        
+        # Default fallback
+        return 30.0
 
     def load_chunk(self):
         display_dirs = [d for d in os.listdir(self.chunk_dir) 
@@ -349,7 +395,7 @@ class Timeline:
         for mouse_json in mouse_jsons:
             match mouse_json["type"]:
                 case "mouse_movement":
-                    mouse_types.append(('position', mouse_json["location"]["x"], mouse_json["location"]["y"]))
+                    mouse_types.append(('position', mouse_json["location"]["x"], mouse_json["location"]["y"], mouse_json["deltaX"], mouse_json["deltaY"]))
                 case "mouse_down":
                     mouse_code = SPECIAL_KEYS[mouse_json["eventType"].replace("Down", "")]
                     mouse_types.append(('press', mouse_code, True))
@@ -366,7 +412,7 @@ class Timeline:
         for (seq, monotonic_time), (event_type, *args) in zip(mouse_timings, mouse_types):
             match event_type:
                 case 'position':
-                    events.append(PositionEvent(seq=seq, time=monotonic_time, x=args[0], y=args[1]))
+                    events.append(PositionEvent(seq=seq, time=monotonic_time, x=args[0], y=args[1], delta_x=args[2], delta_y=args[3]))
                 case 'press':
                     events.append(TimelinePressEvent(seq=seq, time=monotonic_time, key=int(args[0]), down=bool(args[1])))
                 case 'scroll':
@@ -1002,19 +1048,158 @@ class Timeline:
         print(f"{COLORS['header']}END OF ANALYTICS REPORT{COLORS['normal']}")
         print(f"{COLORS['header']}{'='*80}{COLORS['normal']}\n")
 
+    def generate_srt_file(self, filename="timeline.srt", fps=None):
+        """
+        Generate an SRT file from timeline events, clustering non-frame events by frame.
+        SRT timecodes use video playback time (starting from 0 at the first frame)
+        with the original video's frame rate or a specified override.
+        
+        Args:
+            filename: Name of the SRT file to generate
+            fps: Frame rate to use for SRT timecodes (default: use detected FPS)
+            
+        Returns:
+            Path to the saved SRT file.
+        """
+        if not self.timeline_events:
+            logger.error("No timeline events found, cannot generate SRT file")
+            return None
+        
+        # Find all frame events to serve as anchors
+        frame_events = sorted([event for event in self.timeline_events if isinstance(event, FrameEvent)], 
+                             key=lambda x: x.seq)
+        
+        if not frame_events:
+            logger.error("No frame events found, cannot generate SRT file")
+            return None
+        
+        # Get non-frame events
+        non_frame_events = [event for event in self.timeline_events 
+                           if not isinstance(event, FrameEvent)]
+        
+        # Group non-frame events by the frame they belong to
+        events_by_frame = []
+        for i in range(len(frame_events)):
+            current_frame = frame_events[i]
+            next_frame_time = float('inf')
+            
+            if i < len(frame_events) - 1:
+                next_frame_time = frame_events[i+1].time
+            
+            # Find events that occurred between this frame and the next
+            frame_events_group = []
+            for event in non_frame_events:
+                if current_frame.time <= event.time < next_frame_time:
+                    frame_events_group.append(event)
+            
+            # Sort events within this frame by their timestamp
+            frame_events_group.sort(key=lambda x: x.time)
+            events_by_frame.append((current_frame, frame_events_group))
+        
+        # Use detected FPS or override
+        if fps is None:
+            fps = self.video_fps
+        frame_duration_ms = 1000.0 / fps
+        logger.info(f"Using {fps:.2f}fps for SRT timecodes (frame duration: {frame_duration_ms:.2f}ms)")
+        
+        # Generate SRT content
+        srt_content = ""
+        subtitle_index = 1
+        
+        for frame_idx, (frame, events) in enumerate(events_by_frame):
+            if not events:  # Skip frames with no events
+                continue
+                
+            # Calculate video playback timestamps (starting from 0 at first frame)
+            start_time_ms = frame_idx * frame_duration_ms
+            end_time_ms = (frame_idx + 1) * frame_duration_ms
+            
+            # Format timestamps in SRT format (HH:MM:SS,mmm)
+            start_timestamp = self._format_srt_timestamp(start_time_ms)
+            end_timestamp = self._format_srt_timestamp(end_time_ms)
+            
+            # Format events for this frame
+            event_texts = []
+            # Add frame number as header for better readability
+            event_texts.append(f"[Frame #{frame_idx+1}] (Seq: {frame.seq}, Original Time: {self._format_timestamp_readable(frame.time)})")
+            
+            for event in events:
+                rel_time = event.time - frame.time
+                time_indicator = f"+{rel_time}ms" if rel_time > 0 else "0ms"
+                
+                if isinstance(event, TimelinePressEvent):
+                    key_name = SPECIAL_KEYS_REVERSE.get(event.key, f"Key {event.key}")
+                    action = "pressed" if event.down else "released"
+                    event_texts.append(f"• {key_name} {action} [{time_indicator}]")
+                elif isinstance(event, PositionEvent):
+                    event_texts.append(f"• Mouse at ({int(event.x)}, {int(event.y)}, deltas: {int(event.delta_x)}, {int(event.delta_y)}) [{time_indicator}]")
+                elif isinstance(event, TimelineScrollEvent):
+                    event_texts.append(f"• Scroll: ({event.scroll_x}, {event.scroll_y}) [{time_indicator}]")
+            
+            if event_texts:
+                # Format SRT entry
+                srt_content += f"{subtitle_index}\n"
+                srt_content += f"{start_timestamp} --> {end_timestamp}\n"
+                srt_content += "\n".join(event_texts) + "\n\n"
+                subtitle_index += 1
+        
+        # Save SRT file
+        srt_path = os.path.join(self.output_dir, filename)
+        with open(srt_path, "w") as f:
+            f.write(srt_content)
+        
+        logger.info(f"SRT file with {subtitle_index-1} subtitles saved to {srt_path}")
+        return srt_path
+    
+    def _format_srt_timestamp(self, time_ms):
+        """
+        Format milliseconds time into SRT timestamp format: HH:MM:SS,mmm
+        
+        Args:
+            time_ms: Time in milliseconds
+            
+        Returns:
+            Formatted timestamp string
+        """
+        # Convert to components
+        total_seconds = int(time_ms / 1000)
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        milliseconds = int(time_ms % 1000)
+        
+        # Format as SRT timestamp
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+    def _format_timestamp_readable(self, time_ms):
+        """
+        Format milliseconds time into a human-readable format
+        
+        Args:
+            time_ms: Time in milliseconds
+            
+        Returns:
+            Formatted timestamp string
+        """
+        seconds = time_ms / 1000.0
+        return f"{seconds:.3f}s"
+
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--chunk-dir", type=str, required=True)
     parser.add_argument("--output-dir", type=str, help="Directory to save analysis outputs (default: ./data/{chunkname}_analysis)")
-    parser.add_argument("--save-plots", action="store_true", help="Save analytics plots to the output directory")
+    
+    parser.add_argument("--no-plots", action="store_true", help="Disable analytics plots")
     parser.add_argument("--no-highlight", action="store_true", help="Disable highlighting of active patches in the reconstructed video")
+    parser.add_argument("--no-events-overlay", action="store_true", help="Disable keyboard and mouse events overlay on the reconstructed video")
+    parser.add_argument("--no-srt", action="store_true", help="Disable generation of SRT subtitle file with keyboard and mouse events grouped by frame")
+    
     parser.add_argument("--highlight-color", type=str, default="orange", help="Color for highlighting active patches (orange, red, blue, yellow, cyan, magenta, green)")
     parser.add_argument("--highlight-opacity", type=float, default=0.3, help="Opacity of the highlight overlay (0.0 to 1.0)")
-    parser.add_argument("--no-events-overlay", action="store_true", help="Disable keyboard and mouse events overlay on the reconstructed video")
+    parser.add_argument("--srt-filename", type=str, default="timeline.srt", help="Filename for the generated SRT file (default: timeline.srt)")
+    parser.add_argument("--srt-fps", type=float, default=30.0, help="Frame rate to use for SRT timecodes (default: auto-detect from video, fallback to 30.0)")
     args = parser.parse_args()
     
-    # Map color names to BGR values (OpenCV uses BGR)
     color_map = {
         "orange": (0, 165, 255),
         "red": (0, 0, 255),
@@ -1026,11 +1211,9 @@ if __name__ == "__main__":
     }
     highlight_color = color_map.get(args.highlight_color.lower(), (0, 165, 255))  # Default to orange
     
-    # Always collect analytics when running the script directly
     timeline = Timeline(args.chunk_dir, args.output_dir, collect_analytics=True)
     
-    # If save_plots is enabled, render the video with or without highlighting based on args
-    if args.save_plots:
+    if not args.no_plots:
         highlight_active = not args.no_highlight
         show_events_overlay = not args.no_events_overlay
         video_path = timeline.render_reconstructed_video(
@@ -1044,4 +1227,14 @@ if __name__ == "__main__":
                   (" with active patch highlighting" if highlight_active else "") +
                   (" and events overlay" if show_events_overlay else ""))
     
-    timeline.print_analytics(save_plots=args.save_plots)
+    timeline.print_analytics(save_plots=not args.no_plots)
+
+    # Generate SRT file if requested
+    if not args.no_srt:
+        srt_path = timeline.generate_srt_file(
+            filename=args.srt_filename,
+            fps=args.srt_fps if args.srt_fps != 30.0 else None
+        )
+        if srt_path:
+            fps_source = "specified" if args.srt_fps != 30.0 else "detected"
+            print(f"SRT subtitle file saved to {srt_path} using {fps_source} FPS")
