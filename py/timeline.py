@@ -205,7 +205,7 @@ def collect_timeline_analytics(timeline_events: List[FrameEvent | PositionEvent 
                     logger.info(f"Initialized screenstate with shape {screenstate.shape}")
                 
                 state_diff = T.abs(pixels - screenstate).mean(dim=(1,2,3))
-                active_patches = state_diff > 10.0
+                active_patches = state_diff > 1.0
                 active_patches_idx = T.nonzero(active_patches, as_tuple=False)
                 
                 # Log patch activity for this frame
@@ -266,6 +266,10 @@ class Timeline:
         self.patching_analytics = {}
         if collect_analytics:
             self.patching_analytics = collect_timeline_analytics(self.timeline_events)
+        
+        # Initialize tokenized events as None until requested
+        self.tokenized_events = None
+        self.detokenized_events = None
 
     def _detect_video_fps(self) -> float:
         """
@@ -1821,6 +1825,995 @@ class Timeline:
         seconds = time_ms / 1000.0
         return f"{seconds:.3f}s"
 
+    def tokenize_events(self):
+        """
+        Tokenize computer events into discrete integer tokens.
+        
+        The tokenization scheme:
+        - 0: Null token
+        - 1: Patch event token
+        - 2-279: KeyPress events (128 keycodes + 11 special codes) × 2 states (up/down)
+        - 280-360: Mouse movement events in a 9×9 grid
+        - 361-441: Scroll events in a 9×9 grid
+        
+        Returns:
+            List of integer tokens
+        """
+        logger.info("Tokenizing computer events")
+        tokens = []
+        
+        # Constants for token ranges
+        NULL_TOKEN = 0
+        PATCH_TOKEN = 1
+        KEY_TOKEN_START = 2
+        MOVE_TOKEN_START = KEY_TOKEN_START + (128 + 11) * 2  # 280
+        SCROLL_TOKEN_START = MOVE_TOKEN_START + 9 * 9  # 361
+        
+        # Total tokens: 1 (null) + 1 (patch) + 278 (keys) + 81 (move) + 81 (scroll) = 442
+        
+        for event in self.events:
+            if isinstance(event, NullEvent):
+                tokens.append(NULL_TOKEN)
+            elif isinstance(event, PatchEvent):
+                tokens.append(PATCH_TOKEN)
+            elif isinstance(event, PressEvent):
+                # Keys are mapped to 2-279
+                # Formula: KEY_TOKEN_START + key_code * 2 + (1 if down else 0)
+                down_offset = 1 if event.down else 0
+                tokens.append(KEY_TOKEN_START + event.key * 2 + down_offset)
+            elif isinstance(event, MoveEvent):
+                # Mouse movement is quantized to a 9×9 grid (-3,-3) to (3,3) plus outliers
+                # Formula: MOVE_TOKEN_START + quantized_x * 9 + quantized_y
+                
+                def quantize_delta(delta):
+                    if delta < -3:
+                        return 0
+                    elif delta > 3:
+                        return 8
+                    else:
+                        return int(delta) + 4  # Map -3..3 to 1..7
+                
+                quantized_x = quantize_delta(event.delta_x)
+                quantized_y = quantize_delta(event.delta_y)
+                
+                tokens.append(MOVE_TOKEN_START + quantized_x * 9 + quantized_y)
+            elif isinstance(event, ScrollEvent):
+                # Scroll is quantized to a 9×9 grid (-3,-3) to (3,3) plus outliers
+                # Formula: SCROLL_TOKEN_START + quantized_x * 9 + quantized_y
+                
+                def quantize_scroll(scroll):
+                    if scroll < -3:
+                        return 0
+                    elif scroll > 3:
+                        return 8
+                    else:
+                        return int(scroll) + 4  # Map -3..3 to 1..7
+                
+                quantized_x = quantize_scroll(event.scroll_x)
+                quantized_y = quantize_scroll(event.scroll_y)
+                
+                tokens.append(SCROLL_TOKEN_START + quantized_x * 9 + quantized_y)
+        
+        self.tokenized_events = tokens
+        logger.info(f"Tokenized {len(tokens)} computer events")
+        return tokens
+    
+    def detokenize_events(self):
+        """
+        Convert tokenized events back to ComputerEvents to visualize the effect of quantization.
+        
+        Returns:
+            List of ComputerEvents
+        """
+        if self.tokenized_events is None:
+            logger.warning("No tokenized events found. Tokenizing events first.")
+            self.tokenize_events()
+        
+        logger.info("Detokenizing events")
+        detokenized_events = []
+        
+        # Constants for token ranges (must match those in tokenize_events)
+        NULL_TOKEN = 0
+        PATCH_TOKEN = 1
+        KEY_TOKEN_START = 2
+        MOVE_TOKEN_START = KEY_TOKEN_START + (128 + 11) * 2  # 280
+        SCROLL_TOKEN_START = MOVE_TOKEN_START + 9 * 9  # 361
+        
+        # Build a map of original key codes to readable names from the original events
+        key_to_readable = {}
+        for event in self.events:
+            if isinstance(event, PressEvent):
+                key_to_readable[event.key] = event.readable
+        
+        for i, token in enumerate(self.tokenized_events):
+            # Get original event for seq and dur
+            orig_event = self.events[i]
+            seq = orig_event.seq
+            dur = orig_event.dur
+            
+            if token == NULL_TOKEN:
+                detokenized_events.append(NullEvent(seq=seq, dur=dur))
+            elif token == PATCH_TOKEN:
+                # For PatchEvent, we don't have the pixel data, but we can use the grid positions
+                if isinstance(orig_event, PatchEvent):
+                    # Use the original event's data
+                    detokenized_events.append(PatchEvent(
+                        seq=seq, dur=dur, pixels=orig_event.pixels, 
+                        grid_x=orig_event.grid_x, grid_y=orig_event.grid_y
+                    ))
+                else:
+                    # This shouldn't happen in correct tokenization
+                    logger.warning(f"Unexpected token {token} at position {i}")
+                    detokenized_events.append(NullEvent(seq=seq, dur=dur))
+            elif KEY_TOKEN_START <= token < MOVE_TOKEN_START:
+                # KeyPress events
+                token_offset = token - KEY_TOKEN_START
+                key_code = token_offset // 2
+                is_down = (token_offset % 2) == 1
+                
+                # Find readable name by checking both special keys and our map
+                readable = "Unknown"
+                
+                # First check if it's a special key
+                for key, value in SPECIAL_KEYS.items():
+                    if value == key_code:
+                        readable = key
+                        break
+                
+                # If not found in special keys, check our map from original events
+                if readable == "Unknown" and key_code in key_to_readable:
+                    readable = key_to_readable[key_code]
+                
+                detokenized_events.append(PressEvent(
+                    seq=seq, dur=dur, key=key_code, down=is_down, readable=readable
+                ))
+            elif MOVE_TOKEN_START <= token < SCROLL_TOKEN_START:
+                # Mouse movement events
+                token_offset = token - MOVE_TOKEN_START
+                quantized_x = token_offset // 9
+                quantized_y = token_offset % 9
+                
+                # Convert quantized values back to deltas
+                def dequantize_delta(quantized):
+                    if quantized == 0:
+                        return -4.0
+                    elif quantized == 8:
+                        return 4.0
+                    else:
+                        return float(quantized - 4)
+                
+                delta_x = dequantize_delta(quantized_x)
+                delta_y = dequantize_delta(quantized_y)
+                
+                # For simplicity, we'll set pos_dx and pos_dy equal to delta_x and delta_y
+                detokenized_events.append(MoveEvent(
+                    seq=seq, dur=dur, delta_x=delta_x, delta_y=delta_y, 
+                    pos_dx=delta_x, pos_dy=delta_y
+                ))
+            elif SCROLL_TOKEN_START <= token < SCROLL_TOKEN_START + 81:
+                # Scroll events
+                token_offset = token - SCROLL_TOKEN_START
+                quantized_x = token_offset // 9
+                quantized_y = token_offset % 9
+                
+                # Convert quantized values back to scroll values
+                def dequantize_scroll(quantized):
+                    if quantized == 0:
+                        return -4
+                    elif quantized == 8:
+                        return 4
+                    else:
+                        return quantized - 4
+                
+                scroll_x = dequantize_scroll(quantized_x)
+                scroll_y = dequantize_scroll(quantized_y)
+                
+                detokenized_events.append(ScrollEvent(
+                    seq=seq, dur=dur, scroll_x=scroll_x, scroll_y=scroll_y
+                ))
+            else:
+                # Invalid token
+                logger.warning(f"Invalid token {token} at position {i}")
+                detokenized_events.append(NullEvent(seq=seq, dur=dur))
+        
+        self.detokenized_events = detokenized_events
+        logger.info(f"Detokenized {len(detokenized_events)} events")
+        return detokenized_events
+    
+    def render_quantized_video(self, output_path=None, fps=30):
+        """
+        Render a video reconstructed from the tokenized and then detokenized events
+        to visualize the effect of quantization.
+        
+        Args:
+            output_path: Path to save the video. If None, will save to the output directory.
+            fps: Frames per second for the output video.
+        
+        Returns:
+            Path to the saved video file.
+        """
+        if not output_path:
+            output_path = os.path.join(self.output_dir, "quantized_video.mp4")
+        
+        if self.detokenized_events is None:
+            logger.info("Detokenized events not found. Detokenizing events first.")
+            self.detokenize_events()
+        
+        # Find all FrameEvents to get original dimensions
+        frame_events = [event for event in self.timeline_events if isinstance(event, FrameEvent)]
+        if not frame_events:
+            logger.error("No frame events found, cannot reconstruct video")
+            return None
+        
+        # Get dimensions from the first frame
+        first_frame = frame_events[0].pixels
+        height, width = first_frame.shape[0], first_frame.shape[1]
+        
+        # Create a video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v') # type: ignore
+        video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        # Sort events by sequence number
+        patch_events = sorted([event for event in self.detokenized_events if isinstance(event, PatchEvent)], 
+                             key=lambda x: x.seq)
+        
+        # Group patch events by sequence number (frame)
+        patch_events_by_seq = defaultdict(list)
+        for event in patch_events:
+            patch_events_by_seq[event.seq].append(event)
+        
+        # Sort all events by sequence for the overlay
+        all_events = sorted(self.detokenized_events, key=lambda x: x.seq)
+        
+        # Initialize the screen state
+        screen = np.zeros((height, width, 3), dtype=np.uint8)
+        grid_height = height // PATCH_SIZE
+        grid_width = width // PATCH_SIZE
+        
+        # Initialize event state tracking for overlay
+        current_keys_down = set()
+        current_keys_readable = {}  # Map key code to readable name
+        mouse_pos = (width // 2, height // 2)  # Start in the middle
+        
+        # For visualizing the last mouse delta
+        last_delta_x = 0
+        last_delta_y = 0
+        
+        # For visualizing the last scroll
+        last_scroll_x = 0
+        last_scroll_y = 0
+        
+        # Create a visualization area for controls at the bottom
+        control_panel_height = 160
+        control_panel_width = width
+        
+        # Calculate dimensions for each section of the control panel
+        section_width = control_panel_width // 3
+        
+        # Event history for the current frame
+        current_frame_events = []
+        
+        logger.info(f"Reconstructing quantized video with dimensions {height}x{width} ({grid_height}x{grid_width} patches)")
+        
+        # Add a title banner to indicate this is the quantized version
+        banner_height = 40
+        banner = np.zeros((banner_height, width, 3), dtype=np.uint8)
+        cv2.putText(banner, "QUANTIZED VIDEO (442 Token Types)", 
+                   (width // 2 - 200, banner_height - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        # Process each frame
+        frame_count = 0
+        current_seq = None
+        last_event_idx = 0
+        
+        # Go through all unique sequence numbers
+        for seq in sorted(patch_events_by_seq.keys()):
+            events = patch_events_by_seq[seq]
+            current_seq = seq
+            current_frame_events = []
+            
+            # Find all events that happened since the last frame up to this one
+            while last_event_idx < len(all_events) and all_events[last_event_idx].seq <= seq:
+                event = all_events[last_event_idx]
+                
+                # Track mouse movement
+                if isinstance(event, MoveEvent):
+                    # Store the last delta for visualization
+                    last_delta_x = event.delta_x
+                    last_delta_y = event.delta_y
+                    
+                    # Update absolute position
+                    new_x = mouse_pos[0] + event.pos_dx
+                    new_y = mouse_pos[1] + event.pos_dy
+                    
+                    # Clamp to screen boundaries
+                    new_x = max(0, min(width - 1, new_x))
+                    new_y = max(0, min(height - 1, new_y))
+                    
+                    mouse_pos = (new_x, new_y)
+                
+                # Track scroll events
+                elif isinstance(event, ScrollEvent):
+                    last_scroll_x = event.scroll_x
+                    last_scroll_y = event.scroll_y
+                
+                # Track key presses
+                elif isinstance(event, PressEvent):
+                    if event.down:
+                        current_keys_down.add(event.key)
+                        current_keys_readable[event.key] = event.readable
+                    else:
+                        if event.key in current_keys_down:
+                            current_keys_down.remove(event.key)
+                            if event.key in current_keys_readable:
+                                del current_keys_readable[event.key]
+                
+                current_frame_events.append(event)
+                last_event_idx += 1
+            
+            # Process patch events for this frame
+            for event in events:
+                # Convert grid position to pixel coordinates
+                x1 = event.grid_x * PATCH_SIZE
+                y1 = event.grid_y * PATCH_SIZE
+                x2 = x1 + PATCH_SIZE
+                y2 = y1 + PATCH_SIZE
+                
+                # Update the screen with the patch's pixels
+                patch_np = event.pixels.numpy()
+                screen[y1:y2, x1:x2] = patch_np
+            
+            # Create a copy of the current screen for drawing overlays
+            frame = screen.copy()
+            
+            # Create control panel
+            control_panel = np.zeros((control_panel_height, control_panel_width, 3), dtype=np.uint8)
+            
+            # ----- 1. Mouse Movement Section -----
+            mouse_section = control_panel[:, 0:section_width]
+            
+            # Draw a grid for the mouse delta visualization
+            grid_center_x = section_width // 2
+            grid_center_y = control_panel_height // 2
+            grid_size = 20  # Size of each grid cell
+            grid_span = 3   # Number of cells in each direction from center
+            
+            # Draw grid lines
+            for i in range(-grid_span, grid_span + 1):
+                # Vertical lines
+                cv2.line(mouse_section, 
+                        (grid_center_x + i * grid_size, grid_center_y - grid_span * grid_size),
+                        (grid_center_x + i * grid_size, grid_center_y + grid_span * grid_size),
+                        (50, 50, 50), 1)
+                # Horizontal lines
+                cv2.line(mouse_section,
+                        (grid_center_x - grid_span * grid_size, grid_center_y + i * grid_size),
+                        (grid_center_x + grid_span * grid_size, grid_center_y + i * grid_size),
+                        (50, 50, 50), 1)
+            
+            # Draw coordinate axes
+            cv2.line(mouse_section,
+                    (grid_center_x - grid_span * grid_size, grid_center_y),
+                    (grid_center_x + grid_span * grid_size, grid_center_y),
+                    (0, 255, 255), 1)  # Yellow X-axis
+            cv2.line(mouse_section,
+                    (grid_center_x, grid_center_y - grid_span * grid_size),
+                    (grid_center_x, grid_center_y + grid_span * grid_size),
+                    (0, 255, 255), 1)  # Yellow Y-axis
+            
+            # Draw the mouse delta arrow
+            arrow_end_x = grid_center_x + int(last_delta_x * grid_size)
+            arrow_end_y = grid_center_y + int(last_delta_y * grid_size)
+            
+            # Ensure arrow stays in bounds
+            arrow_end_x = max(grid_center_x - grid_span * grid_size, min(grid_center_x + grid_span * grid_size, arrow_end_x))
+            arrow_end_y = max(grid_center_y - grid_span * grid_size, min(grid_center_y + grid_span * grid_size, arrow_end_y))
+            
+            # Draw the arrow
+            cv2.arrowedLine(mouse_section, 
+                           (grid_center_x, grid_center_y), 
+                           (arrow_end_x, arrow_end_y), 
+                           (0, 165, 255), 2)  # Orange arrow
+            
+            # Add labels
+            cv2.putText(mouse_section, "Mouse Delta", 
+                       (grid_center_x - 50, 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            # Show the actual delta values
+            cv2.putText(mouse_section, f"∆x: {last_delta_x:.1f}, ∆y: {last_delta_y:.1f}", 
+                       (grid_center_x - 70, control_panel_height - 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            # ----- 2. Scroll Section -----
+            scroll_section = control_panel[:, section_width:section_width*2]
+            
+            # Draw a grid for the scroll visualization
+            scroll_center_x = section_width // 2
+            scroll_center_y = control_panel_height // 2
+            
+            # Draw grid lines (same as mouse section)
+            for i in range(-grid_span, grid_span + 1):
+                # Vertical lines
+                cv2.line(scroll_section, 
+                        (scroll_center_x + i * grid_size, scroll_center_y - grid_span * grid_size),
+                        (scroll_center_x + i * grid_size, scroll_center_y + grid_span * grid_size),
+                        (50, 50, 50), 1)
+                # Horizontal lines
+                cv2.line(scroll_section,
+                        (scroll_center_x - grid_span * grid_size, scroll_center_y + i * grid_size),
+                        (scroll_center_x + grid_span * grid_size, scroll_center_y + i * grid_size),
+                        (50, 50, 50), 1)
+            
+            # Draw coordinate axes
+            cv2.line(scroll_section,
+                    (scroll_center_x - grid_span * grid_size, scroll_center_y),
+                    (scroll_center_x + grid_span * grid_size, scroll_center_y),
+                    (0, 255, 255), 1)  # Yellow X-axis
+            cv2.line(scroll_section,
+                    (scroll_center_x, scroll_center_y - grid_span * grid_size),
+                    (scroll_center_x, scroll_center_y + grid_span * grid_size),
+                    (0, 255, 255), 1)  # Yellow Y-axis
+            
+            # Draw the scroll indicator
+            scroll_indicator_x = scroll_center_x + last_scroll_x * grid_size
+            scroll_indicator_y = scroll_center_y + last_scroll_y * grid_size
+            
+            # Ensure indicator stays in bounds
+            scroll_indicator_x = max(scroll_center_x - grid_span * grid_size, 
+                                    min(scroll_center_x + grid_span * grid_size, scroll_indicator_x))
+            scroll_indicator_y = max(scroll_center_y - grid_span * grid_size, 
+                                    min(scroll_center_y + grid_span * grid_size, scroll_indicator_y))
+            
+            # Draw a circle to represent scroll position
+            cv2.circle(scroll_section, 
+                      (int(scroll_indicator_x), int(scroll_indicator_y)), 
+                      5, (0, 255, 0), -1)  # Green circle
+            
+            # Add labels
+            cv2.putText(scroll_section, "Scroll", 
+                       (scroll_center_x - 25, 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            # Show the actual scroll values
+            cv2.putText(scroll_section, f"x: {last_scroll_x}, y: {last_scroll_y}", 
+                       (scroll_center_x - 50, control_panel_height - 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            # ----- 3. Keyboard Section -----
+            key_section = control_panel[:, section_width*2:section_width*3]
+            
+            # Draw header
+            cv2.putText(key_section, "Active Keys", 
+                       (section_width // 2 - 40, 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            # Display active keys with both ID and readable name
+            if current_keys_down:
+                y_pos = 50
+                for key_id in current_keys_down:
+                    readable = current_keys_readable.get(key_id, "Unknown")
+                    key_text = f"Key {key_id} ({readable})"
+                    
+                    # Wrap text if too long
+                    if len(key_text) > 25:
+                        key_text = key_text[:22] + "..."
+                    
+                    cv2.putText(key_section, key_text, 
+                               (20, y_pos), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    y_pos += 25
+                    
+                    # Limit to prevent overflow
+                    if y_pos > control_panel_height - 30:
+                        cv2.putText(key_section, "...", 
+                                   (20, y_pos), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        break
+            else:
+                cv2.putText(key_section, "No keys pressed", 
+                           (20, 50), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+            
+            # Combine control panel sections
+            control_panel[:, 0:section_width] = mouse_section
+            control_panel[:, section_width:section_width*2] = scroll_section
+            control_panel[:, section_width*2:section_width*3] = key_section
+            
+            # Draw separator lines between sections
+            cv2.line(control_panel, 
+                    (section_width, 0), 
+                    (section_width, control_panel_height), 
+                    (100, 100, 100), 1)
+            cv2.line(control_panel, 
+                    (section_width*2, 0), 
+                    (section_width*2, control_panel_height), 
+                    (100, 100, 100), 1)
+            
+            # Draw a mouse cursor at the current position
+            cv2.circle(frame, (int(mouse_pos[0]), int(mouse_pos[1])), 5, (0, 165, 255), -1)
+            
+            # Add the title banner
+            frame_with_banner = np.vstack([banner, frame])
+            
+            # Add the control panel at the bottom
+            frame_with_controls = np.vstack([frame_with_banner, control_panel])
+            
+            # Resize back to original dimensions (removing the banner and control panel)
+            frame_final = cv2.resize(frame_with_controls, (width, height))
+            
+            # Write the frame
+            video_writer.write(frame_final)
+            frame_count += 1
+            
+            if frame_count % 100 == 0:
+                logger.info(f"Processed {frame_count} frames")
+        
+        video_writer.release()
+        logger.info(f"Quantized video saved to {output_path} with {frame_count} frames")
+        return output_path
+
+    def visualize_token_distribution(self, output_path=None):
+        """
+        Generate a visualization of the token distribution to understand the tokenization.
+        
+        Args:
+            output_path: Path to save the visualization. If None, will save to the output directory.
+            
+        Returns:
+            Path to the saved visualization file.
+        """
+        if not output_path:
+            output_path = os.path.join(self.output_dir, "token_distribution.png")
+        
+        if self.tokenized_events is None:
+            logger.info("Tokenized events not found. Tokenizing events first.")
+            self.tokenize_events()
+        
+        # Constants for token ranges
+        NULL_TOKEN = 0
+        PATCH_TOKEN = 1
+        KEY_TOKEN_START = 2
+        MOVE_TOKEN_START = KEY_TOKEN_START + (128 + 11) * 2  # 280
+        SCROLL_TOKEN_START = MOVE_TOKEN_START + 9 * 9  # 361
+        
+        # Count token frequencies
+        token_counts = Counter(self.tokenized_events)
+        
+        # Create categories for the tokens
+        categories = {
+            "Null": [NULL_TOKEN],
+            "Keys (down)": range(KEY_TOKEN_START, MOVE_TOKEN_START, 2),
+            "Keys (up)": range(KEY_TOKEN_START + 1, MOVE_TOKEN_START, 2),
+            "Mouse Movement": range(MOVE_TOKEN_START, SCROLL_TOKEN_START),
+            "Scroll": range(SCROLL_TOKEN_START, SCROLL_TOKEN_START + 81)
+        }
+        
+        # Count tokens by category
+        category_counts = {}
+        for category, token_range in categories.items():
+            category_counts[category] = sum(token_counts.get(token, 0) for token in token_range)
+        
+        # Filter tokens to exclude patch tokens for visualization
+        tokens_without_patches = [token for token in self.tokenized_events if token != PATCH_TOKEN]
+        
+        # Most common tokens (excluding patch tokens)
+        most_common = [item for item in token_counts.most_common(15) if item[0] != PATCH_TOKEN][:10]
+        
+        # Create figures for visualization
+        plt.figure(figsize=(15, 10))
+        
+        # 1. Token categories pie chart
+        plt.subplot(2, 2, 1)
+        plt.pie(category_counts.values(), labels=category_counts.keys(), autopct='%1.1f%%')
+        plt.title('Token Categories Distribution')
+        
+        # 2. Top 10 most common tokens (excluding patch tokens)
+        plt.subplot(2, 2, 2)
+        token_labels = []
+        for token, count in most_common:
+            if token == NULL_TOKEN:
+                token_labels.append("Null")
+            elif KEY_TOKEN_START <= token < MOVE_TOKEN_START:
+                key_code = (token - KEY_TOKEN_START) // 2
+                state = "down" if (token - KEY_TOKEN_START) % 2 == 1 else "up"
+                # Get key name if it's a special key
+                key_name = "Unknown"
+                for k, v in SPECIAL_KEYS.items():
+                    if v == key_code:
+                        key_name = k
+                        break
+                token_labels.append(f"Key {key_name if key_name != 'Unknown' else key_code} ({state})")
+            elif MOVE_TOKEN_START <= token < SCROLL_TOKEN_START:
+                token_offset = token - MOVE_TOKEN_START
+                x = token_offset // 9
+                y = token_offset % 9
+                x_val = x - 4 if x < 4 else ">" + str(x - 4) if x > 4 else "0"
+                y_val = y - 4 if y < 4 else ">" + str(y - 4) if y > 4 else "0"
+                token_labels.append(f"Move ({x_val}, {y_val})")
+            elif SCROLL_TOKEN_START <= token < SCROLL_TOKEN_START + 81:
+                token_offset = token - SCROLL_TOKEN_START
+                x = token_offset // 9
+                y = token_offset % 9
+                x_val = x - 4 if x < 4 else ">" + str(x - 4) if x > 4 else "0"
+                y_val = y - 4 if y < 4 else ">" + str(y - 4) if y > 4 else "0"
+                token_labels.append(f"Scroll ({x_val}, {y_val})")
+            else:
+                token_labels.append(f"Token {token}")
+        
+        plt.barh(range(len(most_common)), [count for _, count in most_common])
+        plt.yticks(range(len(most_common)), token_labels)
+        plt.title('Top 10 Most Common Tokens (Excluding Patch Tokens)')
+        plt.xlabel('Count')
+        
+        # 3. Token histogram (excluding patch tokens)
+        plt.subplot(2, 1, 2)
+        tokens_without_patches_or_null = [token for token in tokens_without_patches if token != NULL_TOKEN]
+        plt.hist(tokens_without_patches_or_null, bins=442, alpha=0.75)
+        plt.title('Token Distribution Histogram (Excluding Patch and Null Tokens)')
+        plt.xlabel('Token ID')
+        plt.ylabel('Frequency')
+        
+        # Add vertical lines to separate token categories
+        category_boundaries = [KEY_TOKEN_START, MOVE_TOKEN_START, SCROLL_TOKEN_START, SCROLL_TOKEN_START + 81]
+        category_names = ["", "Keys", "Mouse", "Scroll", ""]
+        
+        for i in range(1, len(category_boundaries)):
+            plt.axvline(x=category_boundaries[i], color='r', linestyle='--', alpha=0.5)
+            # Add annotations for the categories
+            midpoint = (category_boundaries[i-1] + category_boundaries[i]) / 2
+            plt.text(midpoint, plt.ylim()[1] * 0.9, category_names[i], 
+                     horizontalalignment='center', verticalalignment='center',
+                     bbox=dict(facecolor='white', alpha=0.5))
+        
+        plt.tight_layout()
+        plt.savefig(output_path)
+        plt.close()
+        
+        logger.info(f"Token distribution visualization saved to {output_path}")
+        
+        # Print some statistics about the tokenization
+        total_tokens = len(self.tokenized_events)
+        unique_tokens = len(token_counts)
+        patch_tokens = token_counts.get(PATCH_TOKEN, 0)
+        
+        logger.info(f"Total tokens: {total_tokens}")
+        logger.info(f"Unique tokens used: {unique_tokens} out of 442 possible tokens")
+        logger.info(f"Patch tokens: {patch_tokens} ({patch_tokens/total_tokens*100:.2f}%)")
+        
+        # Print token category statistics
+        for category, count in category_counts.items():
+            logger.info(f"{category}: {count} tokens ({count/total_tokens*100:.2f}%)")
+        
+        return output_path
+    
+    def export_token_sequence(self, output_path=None):
+        """
+        Export the token sequence to a text file for use in other applications.
+        
+        Args:
+            output_path: Path to save the token sequence. If None, will save to the output directory.
+            
+        Returns:
+            Path to the saved token sequence file.
+        """
+        if not output_path:
+            output_path = os.path.join(self.output_dir, "token_sequence.txt")
+        
+        if self.tokenized_events is None:
+            logger.info("Tokenized events not found. Tokenizing events first.")
+            self.tokenize_events()
+        
+        with open(output_path, 'w') as f:
+            # Write header with information about the tokenization
+            f.write("# Timeline token sequence\n")
+            f.write("# Token format: 442 possible token types\n")
+            f.write("# - 0: Null token\n")
+            f.write("# - 1: Patch event token\n")
+            f.write("# - 2-279: KeyPress events (128 keycodes + 11 special codes) × 2 states (up/down)\n")
+            f.write("# - 280-360: Mouse movement events in a 9×9 grid\n")
+            f.write("# - 361-441: Scroll events in a 9×9 grid\n\n")
+            
+            # Write each token on a new line
+            for token in self.tokenized_events:
+                f.write(f"{token}\n")
+        
+        logger.info(f"Token sequence exported to {output_path}")
+        return output_path
+        
+    def export_tensors(self, patches_path=None, events_path=None):
+        """
+        Export tensor data for patches and events in the requested format.
+        
+        Args:
+            patches_path: Path to save the patches tensor file. If None, will save to patches.pt in the output directory.
+            events_path: Path to save the events tensor file. If None, will save to events.pt in the output directory.
+            
+        Returns:
+            Tuple of paths to the saved tensor files (patches_path, events_path).
+        """
+        import torch
+        
+        if not patches_path:
+            patches_path = os.path.join(self.output_dir, "patches.pt")
+        
+        if not events_path:
+            events_path = os.path.join(self.output_dir, "events.pt")
+        
+        # Ensure events are tokenized
+        if self.tokenized_events is None:
+            logger.info("Tokenized events not found. Tokenizing events first.")
+            self.tokenize_events()
+        
+        # Extract patch events for the patches.pt file
+        patch_events = [event for event in self.events if isinstance(event, PatchEvent)]
+        
+        if not patch_events:
+            logger.warning("No patch events found. Cannot create patches.pt")
+            return None, None
+        
+        # Get dimensions from the first patch
+        first_patch = patch_events[0].pixels
+        patch_size = first_patch.shape[0]  # Assuming square patches
+        channels = first_patch.shape[2]
+        
+        # Create tensors for patches.pt
+        num_patches = len(patch_events)
+        
+        # Create pixels tensor: (num_frames) x (patch_size^2 * channels)
+        flattened_size = patch_size * patch_size * channels
+        pixels_tensor = torch.zeros((num_patches, flattened_size))
+        
+        # Create position info tensor: (num_frames) x (temporal_seq, x, y)
+        position_tensor = torch.zeros((num_patches, 3), dtype=torch.long)
+        
+        # Fill the tensors
+        for i, patch in enumerate(patch_events):
+            # Flatten patch pixels from [H, W, C] to [H*W*C]
+            flat_pixels = patch.pixels.reshape(-1)
+            pixels_tensor[i] = flat_pixels
+            
+            # Store position information
+            position_tensor[i, 0] = patch.seq  # temporal sequence
+            position_tensor[i, 1] = patch.grid_x  # x position
+            position_tensor[i, 2] = patch.grid_y  # y position
+        
+        # Constants for token identification
+        PATCH_TOKEN = 1
+        
+        # Filter out patch tokens from the events tensor
+        non_patch_indices = [i for i, token in enumerate(self.tokenized_events) if token != PATCH_TOKEN]
+        filtered_tokens = [self.tokenized_events[i] for i in non_patch_indices]
+        filtered_events = [self.events[i] for i in non_patch_indices]
+        
+        # Create tensor for events.pt: (num_non_patch_events) x (event_type_token, temporal_seq)
+        num_events = len(filtered_tokens)
+        events_tensor = torch.zeros((num_events, 2), dtype=torch.long)
+        
+        # Fill the events tensor (excluding patch events)
+        for i, (token, event) in enumerate(zip(filtered_tokens, filtered_events)):
+            events_tensor[i, 0] = token  # event type token
+            events_tensor[i, 1] = event.seq  # temporal sequence
+        
+        # Save the tensors
+        torch.save({
+            'pixels': pixels_tensor,
+            'position': position_tensor
+        }, patches_path)
+        
+        torch.save({
+            'tokens': events_tensor
+        }, events_path)
+        
+        logger.info(f"Patches data saved to {patches_path} ({num_patches} patches)")
+        logger.info(f"Events data saved to {events_path} ({num_events} non-patch events)")
+        
+        return patches_path, events_path
+        
+    def validate_exported_tensors(self, patches_path=None, events_path=None, output_dir=None):
+        """
+        Decode and validate the exported tensor files by creating visualizations.
+        
+        Args:
+            patches_path: Path to the patches tensor file. If None, will use patches.pt in the output directory.
+            events_path: Path to the events tensor file. If None, will use events.pt in the output directory.
+            output_dir: Directory to save validation outputs. If None, will use the class output directory.
+            
+        Returns:
+            Tuple of paths to the saved validation files (frame_validation_path, events_validation_path).
+        """
+        import torch
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from collections import defaultdict
+        
+        if not patches_path:
+            patches_path = os.path.join(self.output_dir, "patches.pt")
+        
+        if not events_path:
+            events_path = os.path.join(self.output_dir, "events.pt")
+        
+        if not output_dir:
+            output_dir = self.output_dir
+        
+        if not os.path.exists(patches_path) or not os.path.exists(events_path):
+            logger.error(f"Tensor files not found. Run export_tensors first.")
+            return None, None
+        
+        # Load the tensor files
+        patches_data = torch.load(patches_path)
+        events_data = torch.load(events_path)
+        
+        # Get the dimensions of the data
+        pixels_tensor = patches_data['pixels']
+        position_tensor = patches_data['position']
+        events_tensor = events_data['tokens']
+        
+        logger.info(f"Loaded patches tensor with shape {pixels_tensor.shape}")
+        logger.info(f"Loaded position tensor with shape {position_tensor.shape}")
+        logger.info(f"Loaded events tensor with shape {events_tensor.shape} (non-patch events only)")
+        
+        # 1. Validate patches: Reconstruct a sample frame from patches
+        
+        # Find frame events in the original data to get dimensions
+        frame_events = [event for event in self.timeline_events if isinstance(event, FrameEvent)]
+        if not frame_events:
+            logger.error("No frame events found, cannot reconstruct for validation")
+            return None, None
+        
+        # Get dimensions from the first frame
+        first_frame = frame_events[0].pixels
+        height, width = first_frame.shape[0], first_frame.shape[1]
+        
+        # Determine patch dimensions
+        patch_events = [event for event in self.events if isinstance(event, PatchEvent)]
+        if not patch_events:
+            logger.error("No patch events found, cannot reconstruct for validation")
+            return None, None
+        
+        first_patch = patch_events[0].pixels
+        patch_size = first_patch.shape[0]  # Assuming square patches
+        channels = first_patch.shape[2]
+        grid_height = height // patch_size
+        grid_width = width // patch_size
+        
+        # Group patches by seq (frame number)
+        patches_by_seq = defaultdict(list)
+        for i in range(position_tensor.shape[0]):
+            seq = position_tensor[i, 0].item()
+            x = position_tensor[i, 1].item()
+            y = position_tensor[i, 2].item()
+            pixels = pixels_tensor[i].reshape(patch_size, patch_size, channels)
+            patches_by_seq[seq].append((x, y, pixels))
+        
+        # Take the first few sequences to visualize
+        sequences_to_show = min(6, len(patches_by_seq))
+        sample_seqs = sorted(list(patches_by_seq.keys()))[:sequences_to_show]
+        
+        plt.figure(figsize=(15, 5 * sequences_to_show))
+        
+        for idx, seq in enumerate(sample_seqs):
+            # Initialize a blank canvas for this frame
+            frame = np.zeros((height, width, channels))
+            
+            # Place patches on the canvas
+            for x, y, pixels in patches_by_seq[seq]:
+                y_start = y * patch_size
+                y_end = y_start + patch_size
+                x_start = x * patch_size
+                x_end = x_start + patch_size
+                
+                # Ensure we don't go out of bounds
+                if y_end <= height and x_end <= width:
+                    frame[y_start:y_end, x_start:x_end] = pixels.numpy()
+            
+            # Convert to uint8 for display
+            frame = (frame * 255).astype(np.uint8)
+            
+            plt.subplot(sequences_to_show, 1, idx + 1)
+            plt.imshow(frame)
+            plt.title(f"Reconstructed Frame from Sequence {seq}")
+            plt.axis('off')
+        
+        # Save the visualization
+        frame_validation_path = os.path.join(output_dir, "frame_validation.png")
+        plt.tight_layout()
+        plt.savefig(frame_validation_path)
+        plt.close()
+        
+        # 2. Validate events: Decode tokens to event types
+        
+        # Constants for token ranges (must match those in tokenize_events)
+        NULL_TOKEN = 0
+        PATCH_TOKEN = 1  # Note: PATCH_TOKEN should not appear in the events tensor now
+        KEY_TOKEN_START = 2
+        MOVE_TOKEN_START = KEY_TOKEN_START + (128 + 11) * 2  # 280
+        SCROLL_TOKEN_START = MOVE_TOKEN_START + 9 * 9  # 361
+        
+        # Decode a sample of tokens
+        max_events_to_show = 100
+        decoded_events = []
+        
+        # Show at most max_events_to_show events
+        for i in range(min(max_events_to_show, events_tensor.shape[0])):
+            token = events_tensor[i, 0].item()
+            seq = events_tensor[i, 1].item()
+            
+            if token == NULL_TOKEN:
+                event_type = "Null"
+            elif token == PATCH_TOKEN:
+                # This should not happen as we've filtered out patch tokens
+                event_type = "Patch (unexpected - should be in patches.pt)"
+            elif KEY_TOKEN_START <= token < MOVE_TOKEN_START:
+                token_offset = token - KEY_TOKEN_START
+                key_code = token_offset // 2
+                is_down = (token_offset % 2) == 1
+                state = "Down" if is_down else "Up"
+                
+                # Try to get readable key name
+                readable = "Unknown"
+                for key, value in SPECIAL_KEYS.items():
+                    if value == key_code:
+                        readable = key
+                        break
+                
+                event_type = f"Key({readable}, {state})"
+            elif MOVE_TOKEN_START <= token < SCROLL_TOKEN_START:
+                token_offset = token - MOVE_TOKEN_START
+                quantized_x = token_offset // 9
+                quantized_y = token_offset % 9
+                
+                # Dequantize deltas
+                def dequantize_delta(quantized):
+                    if quantized == 0:
+                        return -4.0
+                    elif quantized == 8:
+                        return 4.0
+                    else:
+                        return float(quantized - 4)
+                
+                delta_x = dequantize_delta(quantized_x)
+                delta_y = dequantize_delta(quantized_y)
+                
+                event_type = f"Move(dx={delta_x:.1f}, dy={delta_y:.1f})"
+            elif SCROLL_TOKEN_START <= token < SCROLL_TOKEN_START + 81:
+                token_offset = token - SCROLL_TOKEN_START
+                quantized_x = token_offset // 9
+                quantized_y = token_offset % 9
+                
+                # Dequantize scroll values
+                def dequantize_scroll(quantized):
+                    if quantized == 0:
+                        return -4
+                    elif quantized == 8:
+                        return 4
+                    else:
+                        return quantized - 4
+                
+                scroll_x = dequantize_scroll(quantized_x)
+                scroll_y = dequantize_scroll(quantized_y)
+                
+                event_type = f"Scroll(sx={scroll_x}, sy={scroll_y})"
+            else:
+                event_type = f"Unknown({token})"
+            
+            decoded_events.append((seq, token, event_type))
+        
+        # Save the decoded events to a text file
+        events_validation_path = os.path.join(output_dir, "events_validation.txt")
+        with open(events_validation_path, 'w') as f:
+            f.write("Sequence\tToken\tDecoded Event\n")
+            f.write("-" * 60 + "\n")
+            f.write("Note: Patch events are stored separately in patches.pt\n\n")
+            for seq, token, event_type in decoded_events:
+                f.write(f"{seq}\t{token}\t{event_type}\n")
+        
+        logger.info(f"Frame validation image saved to {frame_validation_path}")
+        logger.info(f"Events validation report saved to {events_validation_path}")
+        
+        return frame_validation_path, events_validation_path
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--chunk-dir", type=str, required=True)
@@ -1830,11 +2823,15 @@ if __name__ == "__main__":
     parser.add_argument("--no-highlight", action="store_true", help="Disable highlighting of active patches in the reconstructed video")
     parser.add_argument("--no-events-overlay", action="store_true", help="Disable keyboard and mouse events overlay on the reconstructed video")
     parser.add_argument("--no-srt", action="store_true", help="Disable generation of SRT subtitle file with keyboard and mouse events grouped by frame")
+    parser.add_argument("--generate-quantized", action="store_true", help="Generate a video showing the quantization effects of tokenization")
+    parser.add_argument("--no-token-export", action="store_true", help="Disable exporting token sequence to text file when using --generate-quantized")
     
     parser.add_argument("--highlight-color", type=str, default="blue", help="Color for highlighting active patches (orange, red, blue, yellow, cyan, magenta, green)")
     parser.add_argument("--highlight-opacity", type=float, default=0.1, help="Opacity of the highlight overlay (0.0 to 1.0)")
     parser.add_argument("--srt-filename", type=str, default="timeline.srt", help="Filename for the generated SRT file (default: timeline.srt)")
     parser.add_argument("--srt-fps", type=float, default=30.0, help="Frame rate to use for SRT timecodes (default: auto-detect from video, fallback to 30.0)")
+    parser.add_argument("--export-tensors", action="store_true", help="Export patches.pt and events.pt tensor files for ML training")
+    parser.add_argument("--validate-tensors", action="store_true", help="Validate exported tensor files by generating visualizations")
     args = parser.parse_args()
     
     color_map = {
@@ -1864,6 +2861,27 @@ if __name__ == "__main__":
                   (" with active patch highlighting" if highlight_active else "") +
                   (" and events overlay" if show_events_overlay else ""))
     
+    # Generate tokenized/quantized video if requested
+    if args.generate_quantized:
+        # First tokenize events
+        timeline.tokenize_events()
+        
+        # Generate visualization of token distribution
+        token_dist_path = timeline.visualize_token_distribution()
+        if token_dist_path:
+            print(f"Token distribution visualization saved to {token_dist_path}")
+        
+        # Export token sequence unless disabled
+        if not args.no_token_export:
+            token_seq_path = timeline.export_token_sequence()
+            if token_seq_path:
+                print(f"Token sequence exported to {token_seq_path}")
+        
+        # Then render the quantized video
+        quantized_video_path = timeline.render_quantized_video()
+        if quantized_video_path:
+            print(f"Quantized video saved to {quantized_video_path} (shows effects of 442-token quantization)")
+    
     timeline.print_analytics(save_plots=not args.no_plots)
 
     # Generate SRT file if requested
@@ -1875,3 +2893,19 @@ if __name__ == "__main__":
         if srt_path:
             fps_source = "specified" if args.srt_fps != 30.0 else "detected"
             print(f"SRT subtitle file saved to {srt_path} using {fps_source} FPS")
+    
+    # Export tensor files if requested
+    if args.export_tensors:
+        patches_path, events_path = timeline.export_tensors()
+        if patches_path and events_path:
+            print(f"Patches tensor saved to {patches_path}")
+            print(f"Events tensor saved to {events_path}")
+    
+    # Validate tensor files if requested
+    if args.validate_tensors:
+        if not args.export_tensors:
+            print("Loading previously exported tensor files for validation...")
+        frame_validation_path, events_validation_path = timeline.validate_exported_tensors()
+        if frame_validation_path and events_validation_path:
+            print(f"Frame validation image saved to {frame_validation_path}")
+            print(f"Events validation report saved to {events_validation_path}")
