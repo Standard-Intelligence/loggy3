@@ -72,6 +72,9 @@ class PressEvent(ComputerEvent):
     key: int # key code or mouse button
     down: bool # down or up
 
+class NullEvent(ComputerEvent):
+    pass
+
 SPECIAL_KEYS = {
     # outside of the normal keycode range
     "alphaShift": 1001,
@@ -109,7 +112,15 @@ def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent
         match event:
             case FrameEvent():
                 pixels = event.pixels.float()
-                assert pixels.shape[0] % PATCH_SIZE == 0 and pixels.shape[1] % PATCH_SIZE == 0, f"Pixels shape {pixels.shape} is not divisible by patch size {PATCH_SIZE}"
+                
+                # Handle non-divisible dimensions by cropping to the nearest multiple of PATCH_SIZE
+                orig_h, orig_w = pixels.shape[0], pixels.shape[1]
+                new_h = (orig_h // PATCH_SIZE) * PATCH_SIZE
+                new_w = (orig_w // PATCH_SIZE) * PATCH_SIZE
+                
+                if new_h != orig_h or new_w != orig_w:
+                    logger.info(f"Cropping frame from {orig_h}x{orig_w} to {new_h}x{new_w} to be divisible by patch size {PATCH_SIZE}")
+                    pixels = pixels[:new_h, :new_w, :]
                 
                 grid_height = pixels.shape[0] // PATCH_SIZE
                 grid_width = pixels.shape[1] // PATCH_SIZE
@@ -121,6 +132,8 @@ def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent
                 state_diff = T.abs(pixels - screenstate).mean(dim=(1,2,3))
                 active_patches = state_diff > 10.0
                 active_patches_idx = T.nonzero(active_patches, as_tuple=False)
+                
+                computer_events.append(NullEvent(seq=event.seq, dur=event_dur))
                 
                 for patch_idx in active_patches_idx:
                     patch_idx_val = int(patch_idx.item())  # Convert tensor to int
@@ -366,7 +379,7 @@ class Timeline:
     def __getitem__(self, index):
         return self.events[index]
     
-    def render_reconstructed_video(self, output_path=None, fps=30, highlight_active=True, highlight_color=(0, 165, 255), highlight_opacity=0.3):
+    def render_reconstructed_video(self, output_path=None, fps=30, highlight_active=True, highlight_color=(0, 165, 255), highlight_opacity=0.3, show_events_overlay=True):
         """
         Render a video reconstructed from the active patches.
         
@@ -376,6 +389,7 @@ class Timeline:
             highlight_active: Whether to highlight active patches with an overlay.
             highlight_color: BGR color tuple for the highlight overlay (default is orange in BGR).
             highlight_opacity: Opacity of the highlight overlay (0.0 to 1.0).
+            show_events_overlay: Whether to display keyboard and mouse events as an overlay.
         
         Returns:
             Path to the saved video file.
@@ -406,17 +420,59 @@ class Timeline:
         for event in patch_events:
             patch_events_by_seq[event.seq].append(event)
         
+        # Sort all events by sequence for the overlay
+        all_events = sorted(self.events, key=lambda x: x.seq)
+        
         # Initialize the screen state
         screen = np.zeros((height, width, 3), dtype=np.uint8)
         grid_height = height // PATCH_SIZE
         grid_width = width // PATCH_SIZE
         
+        # Initialize event state tracking for overlay
+        current_keys_down = set()
+        last_mouse_pos = (0, 0)
+        last_scroll = (0, 0)
+        
+        # Event history for the current frame
+        current_frame_events = []
+        
         logger.info(f"Reconstructing video with dimensions {height}x{width} ({grid_height}x{grid_width} patches)")
         
         # Process each frame
         frame_count = 0
+        current_seq = None
+        last_event_idx = 0
+        
+        # Go through all unique sequence numbers
         for seq in sorted(patch_events_by_seq.keys()):
             events = patch_events_by_seq[seq]
+            current_seq = seq
+            current_frame_events = []
+            
+            # Find all events that happened since the last frame up to this one
+            while last_event_idx < len(all_events) and all_events[last_event_idx].seq <= seq:
+                event = all_events[last_event_idx]
+                
+                # Track event state for overlay
+                if isinstance(event, PressEvent):
+                    if event.down:
+                        current_keys_down.add(event.key)
+                        current_frame_events.append(f"Key down: {SPECIAL_KEYS_REVERSE.get(event.key, str(event.key))}")
+                    else:
+                        if event.key in current_keys_down:
+                            current_keys_down.remove(event.key)
+                        current_frame_events.append(f"Key up: {SPECIAL_KEYS_REVERSE.get(event.key, str(event.key))}")
+                
+                elif isinstance(event, MoveEvent):
+                    last_mouse_pos = (last_mouse_pos[0] + event.delta_x, last_mouse_pos[1] + event.delta_y)
+                    current_frame_events.append(f"Mouse move: ({int(last_mouse_pos[0])}, {int(last_mouse_pos[1])})")
+                
+                elif isinstance(event, ScrollEvent):
+                    last_scroll = (event.scroll_x, event.scroll_y)
+                    if event.scroll_x != 0 or event.scroll_y != 0:
+                        current_frame_events.append(f"Scroll: ({event.scroll_x}, {event.scroll_y})")
+                
+                last_event_idx += 1
             
             # Apply all patches for this frame
             for event in events:
@@ -453,6 +509,45 @@ class Timeline:
                 
                 # Apply the overlay with the specified opacity
                 cv2.addWeighted(overlay, highlight_opacity, frame, 1.0, 0, frame)
+            
+            # Add event overlay if enabled
+            if show_events_overlay:
+                # Create semi-transparent background for text
+                text_bg = np.zeros_like(frame)
+                # Move the background rectangle to the right side
+                right_margin = 10
+                bg_width = 350
+                bg_height = 170
+                bg_x = width - bg_width - right_margin
+                cv2.rectangle(text_bg, (bg_x, 0), (width - right_margin, bg_height), (0, 0, 0), -1)
+                
+                # Apply the semi-transparent background
+                alpha = 0.7
+                cv2.addWeighted(text_bg, alpha, frame, 1.0, 0, frame)
+                
+                # Add header - moved to right side
+                cv2.putText(frame, f"Frame #{frame_count} (Seq: {current_seq})", 
+                           (bg_x + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                # Show mouse position - moved to right side
+                cv2.putText(frame, f"Mouse: ({int(last_mouse_pos[0])}, {int(last_mouse_pos[1])})", 
+                           (bg_x + 10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                
+                # Show keys currently held down - moved to right side
+                keys_text = "Keys down: "
+                if current_keys_down:
+                    keys_text += ", ".join([SPECIAL_KEYS_REVERSE.get(k, str(k)) for k in current_keys_down])
+                else:
+                    keys_text += "None"
+                
+                cv2.putText(frame, keys_text, (bg_x + 10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                
+                # Show recent events for this frame (last 3) - moved to right side
+                cv2.putText(frame, "Recent events:", (bg_x + 10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                
+                for i, event_text in enumerate(current_frame_events[-3:]):
+                    cv2.putText(frame, event_text, (bg_x + 20, 145 + i * 25), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
             # Write the frame
             video_writer.write(frame)
@@ -916,6 +1011,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-highlight", action="store_true", help="Disable highlighting of active patches in the reconstructed video")
     parser.add_argument("--highlight-color", type=str, default="orange", help="Color for highlighting active patches (orange, red, blue, yellow, cyan, magenta, green)")
     parser.add_argument("--highlight-opacity", type=float, default=0.3, help="Opacity of the highlight overlay (0.0 to 1.0)")
+    parser.add_argument("--no-events-overlay", action="store_true", help="Disable keyboard and mouse events overlay on the reconstructed video")
     args = parser.parse_args()
     
     # Map color names to BGR values (OpenCV uses BGR)
@@ -936,13 +1032,16 @@ if __name__ == "__main__":
     # If save_plots is enabled, render the video with or without highlighting based on args
     if args.save_plots:
         highlight_active = not args.no_highlight
+        show_events_overlay = not args.no_events_overlay
         video_path = timeline.render_reconstructed_video(
             highlight_active=highlight_active,
             highlight_color=highlight_color,
-            highlight_opacity=args.highlight_opacity
+            highlight_opacity=args.highlight_opacity,
+            show_events_overlay=show_events_overlay
         )
         if video_path:
             print(f"Reconstructed video saved to {video_path}" + 
-                  (" with active patch highlighting" if highlight_active else ""))
+                  (" with active patch highlighting" if highlight_active else "") +
+                  (" and events overlay" if show_events_overlay else ""))
     
     timeline.print_analytics(save_plots=args.save_plots)
