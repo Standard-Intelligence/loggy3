@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from datetime import timedelta
 import logging
 import argparse
+import math
 
 # Configure logging
 logging.basicConfig(
@@ -47,6 +48,7 @@ class TimelineScrollEvent(TimelineEvent):
 class TimelinePressEvent(TimelineEvent):
     key: int # key code or mouse button
     down: bool # down or up
+    readable: str # human readable key name
 
 
 @dataclass
@@ -77,29 +79,28 @@ class ScrollEvent(ComputerEvent):
 class PressEvent(ComputerEvent):
     key: int # key code or mouse button
     down: bool # down or up
+    readable: str # human readable key name
 
 class NullEvent(ComputerEvent):
     pass
 
 SPECIAL_KEYS = {
     # outside of the normal keycode range
-    "alphaShift": 1001,
-    "shift": 1002,
-    "control": 1003,
-    "alternate": 1004,
-    "command": 1005,
-    "help": 1006,
-    "secondaryFn": 1007,
-    "numericPad": 1008,
-    "nonCoalesced": 1009,
+    "alphaShift": 128,
+    "shift": 129,
+    "control": 130,
+    "alternate": 131,
+    "command": 132,
+    "help": 133,
+    "secondaryFn": 134,
+    "numericPad": 135,
+    "nonCoalesced": 136,
 
     # mouse buttons
-    "LeftMouse": 1010,
-    "RightMouse": 1011,    
+    "LeftMouse": 137,
+    "RightMouse": 138,   
 }
 
-# Reverse mapping for analytics
-SPECIAL_KEYS_REVERSE = {v: k for k, v in SPECIAL_KEYS.items()}
 PATCH_SIZE = 10
 
 def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent | TimelineScrollEvent | TimelinePressEvent]) -> List[ComputerEvent]:
@@ -136,7 +137,7 @@ def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent
                     screenstate = T.zeros_like(pixels)
                 
                 state_diff = T.abs(pixels - screenstate).mean(dim=(1,2,3))
-                active_patches = state_diff > 10.0
+                active_patches = state_diff > 1.0
                 active_patches_idx = T.nonzero(active_patches, as_tuple=False)
                 
                 computer_events.append(NullEvent(seq=event.seq, dur=event_dur))
@@ -161,7 +162,7 @@ def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent
                     seq=event.seq, dur=event_dur, scroll_x=event.scroll_x, scroll_y=event.scroll_y))
             case TimelinePressEvent():
                 computer_events.append(PressEvent(
-                    seq=event.seq, dur=event_dur, key=event.key, down=event.down))
+                    seq=event.seq, dur=event_dur, key=event.key, down=event.down, readable=event.readable))
     
     return computer_events
 
@@ -355,19 +356,19 @@ class Timeline:
             keypress_jsons.append(json.loads(keypress_raw[1]))
         assert len(keypress_timings) == len(keypress_jsons)
 
-        keypress_types: List[Tuple[int, bool]] = []
+        keypress_types: List[Tuple[int, bool, str]] = []
         for keypress_json in keypress_jsons:
             match keypress_json["type"]:
                 case "key_down":
-                    keypress_types.append((keypress_json["keycode"], True))
+                    keypress_types.append((keypress_json["keycode"], True, keypress_json["keycodeStr"]))
                 case "key_up":
-                    keypress_types.append((keypress_json["keycode"], False))
+                    keypress_types.append((keypress_json["keycode"], False, keypress_json["keycodeStr"]))
                 case "flags_changed":
                     if len(keypress_json["flagsChanged"].keys()) != 1: 
                         logger.warning(f"Expected only one key in flagsChanged, but got {keypress_json['flagsChanged'].keys()}")
                     flag_key, flag_value = next(iter(keypress_json["flagsChanged"].items()))
                     is_pressed = flag_value == "pressed"
-                    keypress_types.append((SPECIAL_KEYS[flag_key], is_pressed))
+                    keypress_types.append((SPECIAL_KEYS[flag_key], is_pressed, flag_key))
                 case _:
                     raise ValueError(f"Unknown keypress type: {keypress_json['type']}")
         assert len(keypress_timings) == len(keypress_types)
@@ -376,7 +377,8 @@ class Timeline:
             seq=seq, 
             time=monotonic_time, 
             key=key, 
-            down=down) for (seq, monotonic_time), (key, down) in zip(keypress_timings, keypress_types)]
+            down=down, 
+            readable=readable) for (seq, monotonic_time), (key, down, readable) in zip(keypress_timings, keypress_types)]
 
     def load_mouse(self, mouse_log: str) -> List[Union[PositionEvent, TimelineScrollEvent, TimelinePressEvent]]:
         mouse_raws = []
@@ -391,17 +393,17 @@ class Timeline:
             mouse_jsons.append(json.loads(mouse_raw[1]))
         assert len(mouse_timings) == len(mouse_jsons)
 
-        mouse_types: List[Union[Tuple[str, float, float], Tuple[str, int, bool], Tuple[str, int, int]]] = []
+        mouse_types: List[Union[Tuple[str, float, float], Tuple[str, int, bool, str], Tuple[str, int, int]]] = []
         for mouse_json in mouse_jsons:
             match mouse_json["type"]:
                 case "mouse_movement":
                     mouse_types.append(('position', mouse_json["location"]["x"], mouse_json["location"]["y"], mouse_json["deltaX"], mouse_json["deltaY"]))
                 case "mouse_down":
                     mouse_code = SPECIAL_KEYS[mouse_json["eventType"].replace("Down", "")]
-                    mouse_types.append(('press', mouse_code, True))
+                    mouse_types.append(('press', mouse_code, True, mouse_json["eventType"].replace("Down", "")))
                 case "mouse_up":
                     mouse_code = SPECIAL_KEYS[mouse_json["eventType"].replace("Up", "")]
-                    mouse_types.append(('press', mouse_code, False))
+                    mouse_types.append(('press', mouse_code, False, mouse_json["eventType"].replace("Up", "")))
                 case "scroll_wheel":
                     mouse_types.append(('scroll', mouse_json["pointDeltaAxis1"], mouse_json["pointDeltaAxis2"]))
                 case _:
@@ -414,7 +416,7 @@ class Timeline:
                 case 'position':
                     events.append(PositionEvent(seq=seq, time=monotonic_time, x=args[0], y=args[1], delta_x=args[2], delta_y=args[3]))
                 case 'press':
-                    events.append(TimelinePressEvent(seq=seq, time=monotonic_time, key=int(args[0]), down=bool(args[1])))
+                    events.append(TimelinePressEvent(seq=seq, time=monotonic_time, key=int(args[0]), down=bool(args[1]), readable=args[2]))
                 case 'scroll':
                     events.append(TimelineScrollEvent(seq=seq, time=monotonic_time, scroll_x=int(args[0]), scroll_y=int(args[1])))
         return events
@@ -479,6 +481,19 @@ class Timeline:
         last_mouse_pos = (0, 0)
         last_scroll = (0, 0)
         
+        # For mouse delta visualization
+        mouse_deltas = []  # Keep track of recent mouse deltas
+        max_deltas_history = 10  # Number of recent deltas to track
+        
+        # For scroll visualization
+        scroll_history = []  # Keep track of recent scroll events
+        max_scroll_history = 20  # Number of recent scroll events to track
+        
+        # For key event visualization
+        recent_key_events = []  # Keep track of recent key events (down/up, key, time)
+        max_key_events = 10  # Number of recent key events to track
+        key_event_duration = 20  # Number of frames a key event is highlighted
+        
         # Event history for the current frame
         current_frame_events = []
         
@@ -495,6 +510,10 @@ class Timeline:
             current_seq = seq
             current_frame_events = []
             
+            # Current frame mouse delta
+            current_delta_x = 0
+            current_delta_y = 0
+            
             # Find all events that happened since the last frame up to this one
             while last_event_idx < len(all_events) and all_events[last_event_idx].seq <= seq:
                 event = all_events[last_event_idx]
@@ -502,19 +521,35 @@ class Timeline:
                 # Track event state for overlay
                 if isinstance(event, PressEvent):
                     if event.down:
-                        current_keys_down.add(event.key)
-                        current_frame_events.append(f"Key down: {SPECIAL_KEYS_REVERSE.get(event.key, str(event.key))}")
+                        current_keys_down.add(event.readable)
+                        current_frame_events.append(f"Key down: {event.readable}")
+                        # Add to recent key events for visualization
+                        recent_key_events.append((True, event.readable, frame_count))
+                        if len(recent_key_events) > max_key_events:
+                            recent_key_events.pop(0)
                     else:
-                        if event.key in current_keys_down:
-                            current_keys_down.remove(event.key)
-                        current_frame_events.append(f"Key up: {SPECIAL_KEYS_REVERSE.get(event.key, str(event.key))}")
+                        if event.readable in current_keys_down:
+                            current_keys_down.remove(event.readable)
+                        current_frame_events.append(f"Key up: {event.readable}")
+                        # Add to recent key events for visualization
+                        recent_key_events.append((False, event.readable, frame_count))
+                        if len(recent_key_events) > max_key_events:
+                            recent_key_events.pop(0)
                 
                 elif isinstance(event, MoveEvent):
+                    current_delta_x = event.delta_x
+                    current_delta_y = event.delta_y
                     last_mouse_pos = (last_mouse_pos[0] + event.delta_x, last_mouse_pos[1] + event.delta_y)
-                    current_frame_events.append(f"Mouse move: ({int(last_mouse_pos[0])}, {int(last_mouse_pos[1])})")
+                    mouse_deltas.append((current_delta_x, current_delta_y))
+                    if len(mouse_deltas) > max_deltas_history:
+                        mouse_deltas.pop(0)
+                    current_frame_events.append(f"Mouse move: ({event.pos_dx}, {event.pos_dy}, {event.delta_x}, {event.delta_y})")
                 
                 elif isinstance(event, ScrollEvent):
                     last_scroll = (event.scroll_x, event.scroll_y)
+                    scroll_history.append(last_scroll)
+                    if len(scroll_history) > max_scroll_history:
+                        scroll_history.pop(0)
                     if event.scroll_x != 0 or event.scroll_y != 0:
                         current_frame_events.append(f"Scroll: ({event.scroll_x}, {event.scroll_y})")
                 
@@ -553,19 +588,47 @@ class Timeline:
                         # Fill the patch area with the highlight color
                         overlay[y_start:y_end, x_start:x_end] = highlight_color
                 
-                # Apply the overlay with the specified opacity
                 cv2.addWeighted(overlay, highlight_opacity, frame, 1.0, 0, frame)
             
             # Add event overlay if enabled
             if show_events_overlay:
                 # Create semi-transparent background for text
                 text_bg = np.zeros_like(frame)
-                # Move the background rectangle to the right side
+                
+                # Background for the text overlay (top right)
                 right_margin = 10
                 bg_width = 350
                 bg_height = 170
                 bg_x = width - bg_width - right_margin
                 cv2.rectangle(text_bg, (bg_x, 0), (width - right_margin, bg_height), (0, 0, 0), -1)
+                
+                # Background for mouse delta arrow (center)
+                arrow_bg_size = 200
+                arrow_bg_x = (width - arrow_bg_size) // 2
+                arrow_bg_y = (height - arrow_bg_size) // 2
+                cv2.rectangle(text_bg, 
+                             (arrow_bg_x, arrow_bg_y), 
+                             (arrow_bg_x + arrow_bg_size, arrow_bg_y + arrow_bg_size), 
+                             (0, 0, 0), -1)
+                
+                # Background for scroll visualization (bottom right)
+                scroll_bg_size = 150
+                scroll_bg_x = width - scroll_bg_size - right_margin
+                scroll_bg_y = height - scroll_bg_size - 10
+                cv2.rectangle(text_bg, 
+                             (scroll_bg_x, scroll_bg_y), 
+                             (scroll_bg_x + scroll_bg_size, scroll_bg_y + scroll_bg_size), 
+                             (0, 0, 0), -1)
+                
+                # Background for keyboard visualization (bottom left of scroll)
+                keyboard_bg_width = 300
+                keyboard_bg_height = 150
+                keyboard_bg_x = scroll_bg_x - keyboard_bg_width - 10
+                keyboard_bg_y = height - keyboard_bg_height - 10
+                cv2.rectangle(text_bg, 
+                             (keyboard_bg_x, keyboard_bg_y), 
+                             (keyboard_bg_x + keyboard_bg_width, keyboard_bg_y + keyboard_bg_height), 
+                             (0, 0, 0), -1)
                 
                 # Apply the semi-transparent background
                 alpha = 0.7
@@ -582,7 +645,7 @@ class Timeline:
                 # Show keys currently held down - moved to right side
                 keys_text = "Keys down: "
                 if current_keys_down:
-                    keys_text += ", ".join([SPECIAL_KEYS_REVERSE.get(k, str(k)) for k in current_keys_down])
+                    keys_text += ", ".join(current_keys_down)
                 else:
                     keys_text += "None"
                 
@@ -594,6 +657,306 @@ class Timeline:
                 for i, event_text in enumerate(current_frame_events[-3:]):
                     cv2.putText(frame, event_text, (bg_x + 20, 145 + i * 25), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                # Draw mouse delta arrow in the center
+                arrow_center_x = arrow_bg_x + arrow_bg_size // 2
+                arrow_center_y = arrow_bg_y + arrow_bg_size // 2
+                
+                # Draw coordinate system
+                cv2.line(frame, 
+                        (arrow_center_x, arrow_bg_y + 10), 
+                        (arrow_center_x, arrow_bg_y + arrow_bg_size - 10), 
+                        (100, 100, 100), 1)  # Vertical line
+                cv2.line(frame, 
+                        (arrow_bg_x + 10, arrow_center_y), 
+                        (arrow_bg_x + arrow_bg_size - 10, arrow_center_y), 
+                        (100, 100, 100), 1)  # Horizontal line
+                
+                # Scale factor for arrow (to make it visible)
+                scale = 3.0
+                
+                # Draw mouse delta arrow
+                if current_delta_x != 0 or current_delta_y != 0:
+                    # Calculate arrow endpoint with scaling
+                    arrow_end_x = int(arrow_center_x + current_delta_x * scale)
+                    arrow_end_y = int(arrow_center_y + current_delta_y * scale)
+                    
+                    # Draw the main arrow
+                    cv2.arrowedLine(frame, 
+                                   (arrow_center_x, arrow_center_y), 
+                                   (arrow_end_x, arrow_end_y), 
+                                   (0, 255, 0), 2, tipLength=0.3)
+                
+                # Draw historical mouse deltas with fading color
+                for i, (dx, dy) in enumerate(mouse_deltas[:-1]):  # Skip the most recent one (already drawn)
+                    # Calculate color intensity based on recency (older = more faded)
+                    intensity = int(255 * (i / len(mouse_deltas)))
+                    color = (0, intensity, 0)
+                    
+                    # Calculate arrow endpoint with scaling
+                    hist_arrow_end_x = int(arrow_center_x + dx * scale)
+                    hist_arrow_end_y = int(arrow_center_y + dy * scale)
+                    
+                    # Draw historical arrow (thinner)
+                    cv2.arrowedLine(frame, 
+                                   (arrow_center_x, arrow_center_y), 
+                                   (hist_arrow_end_x, hist_arrow_end_y), 
+                                   color, 1, tipLength=0.2)
+                
+                # Add label for mouse delta visualization
+                cv2.putText(frame, "Mouse Movement", 
+                           (arrow_bg_x + 10, arrow_bg_y - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                
+                # Draw scroll visualization in bottom right
+                # Create a small coordinate system in the scroll area
+                scroll_center_x = scroll_bg_x + scroll_bg_size // 2
+                scroll_center_y = scroll_bg_y + scroll_bg_size // 2
+                
+                # Draw coordinate axes
+                cv2.line(frame, 
+                        (scroll_center_x, scroll_bg_y + 10), 
+                        (scroll_center_x, scroll_bg_y + scroll_bg_size - 10), 
+                        (100, 100, 100), 1)  # Vertical line
+                cv2.line(frame, 
+                        (scroll_bg_x + 10, scroll_center_y), 
+                        (scroll_bg_x + scroll_bg_size - 10, scroll_center_y), 
+                        (100, 100, 100), 1)  # Horizontal line
+                
+                # Mark the center point
+                cv2.circle(frame, (scroll_center_x, scroll_center_y), 2, (150, 150, 150), -1)
+                
+                # Draw axis labels
+                cv2.putText(frame, "+Y", 
+                           (scroll_center_x + 5, scroll_bg_y + 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                cv2.putText(frame, "-Y", 
+                           (scroll_center_x + 5, scroll_bg_y + scroll_bg_size - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                cv2.putText(frame, "-X", 
+                           (scroll_bg_x + 15, scroll_center_y - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                cv2.putText(frame, "+X", 
+                           (scroll_bg_x + scroll_bg_size - 25, scroll_center_y - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                
+                # Draw scroll history points
+                scroll_scale = 1.5  # Scale factor for scroll values - increased from 1.0
+                
+                # Symmetric log (symlog) transformation function
+                def symlog_transform(val, linear_threshold=5.0, min_visual_val=3.0):
+                    if val == 0:
+                        return 0
+                    
+                    # For small non-zero values, ensure minimum visual displacement
+                    if abs(val) <= 1:
+                        return min_visual_val * (1 if val > 0 else -1)
+                        
+                    # For other small values, apply linear scaling with minimum visual effect
+                    elif abs(val) < linear_threshold:
+                        # Scale linearly but ensure it's visibly larger than the minimum
+                        scaled = (abs(val) / linear_threshold) * (linear_threshold - min_visual_val) + min_visual_val
+                        return scaled * (1 if val > 0 else -1)
+                    else:
+                        # Log region with sign preservation for large values
+                        sign = 1 if val >= 0 else -1
+                        log_val = math.log10(abs(val) - linear_threshold + 1) + linear_threshold
+                        return sign * log_val
+                
+                for i, (sx, sy) in enumerate(scroll_history):
+                    # Calculate color intensity based on recency (newer = brighter)
+                    intensity = int(155 + 100 * (i / len(scroll_history)))
+                    color = (0, 0, intensity)
+                    
+                    # Apply symlog transformation to scroll values
+                    transformed_sx = symlog_transform(sx) * scroll_scale
+                    transformed_sy = symlog_transform(sy) * scroll_scale
+                    
+                    # Invert Y since positive scroll Y is usually scrolling up
+                    point_x = scroll_center_x + int(transformed_sx)
+                    point_y = scroll_center_y - int(transformed_sy)
+                    
+                    # Draw point
+                    point_size = 3
+                    # Make the most recent point larger and with a different color
+                    if i == len(scroll_history) - 1 and (sx != 0 or sy != 0):
+                        point_size = 5
+                        # Draw a bright circle for latest non-zero scroll
+                        cv2.circle(frame, (point_x, point_y), point_size, (0, 255, 255), -1)
+                        # Draw small text showing the actual scroll values
+                        cv2.putText(frame, f"({sx},{sy})", 
+                                   (point_x + 7, point_y), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+                    else:
+                        cv2.circle(frame, (point_x, point_y), point_size, color, -1)
+                
+                # Add label for scroll visualization
+                cv2.putText(frame, "Scroll History (Symlog)", 
+                           (scroll_bg_x + 10, scroll_bg_y - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                
+                # Draw keyboard visualization
+                # Define keyboard layout (simplified)
+                keyboard_rows = [
+                    ["Esc", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"],
+                    ["`", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=", "Backspace"],
+                    ["Tab", "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "[", "]", "\\"],
+                    ["Caps", "A", "S", "D", "F", "G", "H", "J", "K", "L", ";", "'", "Enter"],
+                    ["Shift", "Z", "X", "C", "V", "B", "N", "M", ",", ".", "/", "Shift"],
+                    ["Ctrl", "Win", "Alt", "Space", "Alt", "Fn", "Menu", "Ctrl"]
+                ]
+                
+                # Draw keyboard
+                key_width = 20
+                key_height = 20
+                key_margin = 2
+                row_margin = 2
+                
+                # Create a mapping of all key positions for event animation
+                key_positions = {}  # key -> (x, y, width, height)
+                
+                for row_idx, row in enumerate(keyboard_rows):
+                    # Adjust starting position for each row to center it
+                    row_width = len(row) * (key_width + key_margin) - key_margin
+                    row_start_x = keyboard_bg_x + (keyboard_bg_width - row_width) // 2
+                    row_start_y = keyboard_bg_y + 30 + row_idx * (key_height + row_margin)
+                    
+                    for key_idx, key in enumerate(row):
+                        key_x = row_start_x + key_idx * (key_width + key_margin)
+                        
+                        # Adjust width for special keys
+                        current_key_width = key_width
+                        if key in ["Backspace", "Tab", "Enter", "Shift", "Ctrl", "Space"]:
+                            if key == "Backspace":
+                                current_key_width = key_width * 2
+                            elif key == "Tab":
+                                current_key_width = key_width * 1.5
+                            elif key == "Enter":
+                                current_key_width = key_width * 2
+                            elif key == "Shift":
+                                current_key_width = key_width * 2
+                            elif key == "Ctrl":
+                                current_key_width = key_width * 1.5
+                            elif key == "Space":
+                                current_key_width = key_width * 5
+                        
+                        # Store key position for event animation
+                        key_positions[key.upper()] = (key_x, row_start_y, int(current_key_width), key_height)
+                        
+                        # Determine if key is pressed - improved to handle different key formats
+                        key_pressed = False
+                        key_upper = key.upper()
+                        
+                        # Map key names to possible variations in event readable strings
+                        key_variations = {
+                            'SHIFT': ['SHIFT', 'shift'],
+                            'CTRL': ['CTRL', 'control', 'CONTROL'],
+                            'ALT': ['ALT', 'option', 'OPTION'],
+                            'ENTER': ['ENTER', 'return', 'RETURN'],
+                            'SPACE': ['SPACE', ' '],
+                            'BACKSPACE': ['BACKSPACE', 'DELETE'],
+                            'ESC': ['ESC', 'ESCAPE'],
+                            'TAB': ['TAB'],
+                        }
+                        
+                        # Check if the key is pressed using various possible names
+                        if key_upper in key_variations:
+                            for variation in key_variations[key_upper]:
+                                if variation in current_keys_down:
+                                    key_pressed = True
+                                    break
+                        else:
+                            # For simple keys, just check if it exists in the current_keys_down set
+                            key_pressed = key_upper in current_keys_down or key in current_keys_down
+                        
+                        # Set color based on pressed state
+                        key_color = (255, 100, 100) if key_pressed else (70, 70, 70)
+                        text_color = (255, 255, 255)
+                        
+                        # Draw key rectangle
+                        cv2.rectangle(frame, 
+                                     (key_x, row_start_y), 
+                                     (key_x + int(current_key_width), row_start_y + key_height), 
+                                     key_color, -1)
+                        
+                        # Draw key text (if it fits)
+                        if len(key) <= 1:
+                            cv2.putText(frame, key, 
+                                       (key_x + int(current_key_width) // 2 - 4, row_start_y + key_height // 2 + 4), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, text_color, 1)
+                
+                # Draw animations for recent key events
+                for is_down, key_name, event_frame in recent_key_events:
+                    # Calculate age of event in frames
+                    age = frame_count - event_frame
+                    if age < key_event_duration:
+                        # Find the correct key position
+                        normalized_key = key_name.upper()
+                        
+                        # Map special keys to their keyboard representation
+                        special_key_mapping = {
+                            ' ': 'SPACE',
+                            'RETURN': 'ENTER',
+                            'DELETE': 'BACKSPACE',
+                            'ESCAPE': 'ESC',
+                            'CONTROL': 'CTRL',
+                            'OPTION': 'ALT',
+                            'shift': 'SHIFT',
+                            'control': 'CTRL',
+                            'option': 'ALT',
+                        }
+                        
+                        if normalized_key in special_key_mapping:
+                            normalized_key = special_key_mapping[normalized_key]
+                            
+                        # Find key position
+                        key_pos = None
+                        # First try exact match
+                        if normalized_key in key_positions:
+                            key_pos = key_positions[normalized_key]
+                        # Then try just the first character (for single keys)
+                        elif len(normalized_key) == 1:
+                            key_pos = key_positions.get(normalized_key, None)
+                        
+                        if key_pos:
+                            x, y, w, h = key_pos
+                            # Calculate animation effect (pulsing glow)
+                            animation_progress = 1.0 - (age / key_event_duration)
+                            glow_size = int(animation_progress * 5)
+                            
+                            # Color for key press/release
+                            if is_down:
+                                glow_color = (0, 255, 0)  # Green for key down
+                            else:
+                                glow_color = (0, 0, 255)  # Red for key up
+                            
+                            # Draw glow effect around key
+                            cv2.rectangle(frame, 
+                                         (x - glow_size, y - glow_size), 
+                                         (x + w + glow_size, y + h + glow_size), 
+                                         glow_color, 2)
+                
+                # Improved key press detection by checking case-insensitive and handling special keys
+                # Debug information - show what keys are actually being tracked
+                debug_y_pos = keyboard_bg_y + keyboard_bg_height - 20
+                active_keys_text = ", ".join(current_keys_down)
+                if len(active_keys_text) > 0:
+                    # Split into multiple lines if too long
+                    if len(active_keys_text) > 30:
+                        chunks = [active_keys_text[i:i+30] for i in range(0, len(active_keys_text), 30)]
+                        for i, chunk in enumerate(chunks):
+                            cv2.putText(frame, chunk, 
+                                      (keyboard_bg_x + 10, debug_y_pos - (len(chunks) - i - 1) * 15), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                    else:
+                        cv2.putText(frame, active_keys_text, 
+                                   (keyboard_bg_x + 10, debug_y_pos), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                # Add label for keyboard visualization
+                cv2.putText(frame, "Keyboard", 
+                           (keyboard_bg_x + 10, keyboard_bg_y + 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             
             # Write the frame
             video_writer.write(frame)
@@ -651,6 +1014,270 @@ class Timeline:
         plt.close()
         
         logger.info(f"Patch activity heatmap saved to {output_path}")
+        return output_path
+
+    def generate_mouse_delta_scatter_plot(self, output_path=None, percentiles=[5, 25, 50, 75, 95]):
+        """
+        Generate a scatter plot of mouse movement deltas with percentile bars and density-based point sizing.
+        
+        Args:
+            output_path: Path to save the plot image. If None, will save to the output directory.
+            percentiles: List of percentiles to show as horizontal and vertical bars.
+            
+        Returns:
+            Path to the saved plot image.
+        """
+        if not output_path:
+            output_path = os.path.join(self.output_dir, "mouse_delta_scatter.png")
+        
+        # Extract all move events
+        move_events = [event for event in self.events if isinstance(event, MoveEvent)]
+        if not move_events:
+            logger.error("No move events found, cannot create mouse delta scatter plot")
+            return None
+        
+        # Extract delta values
+        delta_x_values = [event.delta_x for event in move_events]
+        delta_y_values = [event.delta_y for event in move_events]
+        
+        # Calculate percentiles for both axes
+        x_percentiles = np.percentile(delta_x_values, percentiles)
+        y_percentiles = np.percentile(delta_y_values, percentiles)
+        
+        # Create the scatter plot
+        plt.figure(figsize=(12, 12))
+        
+        # Create a symmetric log scale for better visualization of small and large values
+        plt.xscale('symlog', linthresh=1)  # Linear scale for -1 < x < 1, log scale elsewhere
+        plt.yscale('symlog', linthresh=1)  # Linear scale for -1 < y < 1, log scale elsewhere
+        
+        # Plot the grid centered at 0,0
+        plt.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+        plt.axvline(x=0, color='gray', linestyle='-', alpha=0.5)
+        
+        # Add percentile lines for x-axis
+        for i, p in enumerate(percentiles):
+            plt.axvline(x=x_percentiles[i], color='red', linestyle='--', alpha=0.5, 
+                       label=f'X {p}th percentile: {x_percentiles[i]:.2f}' if i == 0 else "")
+        
+        # Add percentile lines for y-axis
+        for i, p in enumerate(percentiles):
+            plt.axhline(y=y_percentiles[i], color='blue', linestyle='--', alpha=0.5,
+                       label=f'Y {p}th percentile: {y_percentiles[i]:.2f}' if i == 0 else "")
+        
+        # Round values to group nearby points
+        # Lower decimals = more aggressive grouping
+        decimals = 1
+        coords = [(round(x, decimals), round(y, decimals)) for x, y in zip(delta_x_values, delta_y_values)]
+        
+        # Count occurrences of each coordinate pair
+        coord_counts = Counter(coords)
+        
+        # Extract unique coordinates and their counts
+        unique_coords = list(coord_counts.keys())
+        counts = list(coord_counts.values())
+        
+        # Convert to arrays for plotting
+        x_coords = [coord[0] for coord in unique_coords]
+        y_coords = [coord[1] for coord in unique_coords]
+        
+        # Scale marker sizes based on counts
+        # Use a non-linear scaling to make differences more visible
+        min_size = 10
+        max_size = 500
+        min_count = min(counts) if counts else 1
+        max_count = max(counts) if counts else 1
+        
+        # Use a logarithmic scale for better visibility of size differences
+        if max_count > min_count:
+            sizes = [min_size + (max_size - min_size) * (np.log(count) - np.log(min_count)) / 
+                    (np.log(max_count) - np.log(min_count)) for count in counts]
+        else:
+            sizes = [min_size for _ in counts]
+        
+        # Create scatter plot with size and color representing density
+        scatter = plt.scatter(x_coords, y_coords, s=sizes, alpha=0.5, 
+                             c=counts, cmap='viridis', edgecolors='none')
+        
+        # Add a colorbar to show the count scale
+        cbar = plt.colorbar(scatter, label='Point Density')
+        
+        # Set plot limits to ensure it's centered and includes the data
+        max_abs_x = max(abs(min(delta_x_values)), abs(max(delta_x_values)))
+        max_abs_y = max(abs(min(delta_y_values)), abs(max(delta_y_values)))
+        max_abs = max(max_abs_x, max_abs_y) * 1.1  # Add 10% margin
+        plt.xlim(-max_abs, max_abs)
+        plt.ylim(-max_abs, max_abs)
+        
+        # Add labels and title
+        plt.title('Mouse Movement Deltas with Density-Based Sizing (Log Scale)')
+        plt.xlabel('Delta X (symlog scale)')
+        plt.ylabel('Delta Y (symlog scale)')
+        
+        # Add statistical information to the plot
+        plt.figtext(0.02, 0.02, 
+                   f"X range: [{min(delta_x_values):.2f}, {max(delta_x_values):.2f}]\n"
+                   f"Y range: [{min(delta_y_values):.2f}, {max(delta_y_values):.2f}]\n"
+                   f"X median: {np.median(delta_x_values):.2f}\n"
+                   f"Y median: {np.median(delta_y_values):.2f}\n"
+                   f"Total points: {len(delta_x_values)}\n"
+                   f"Unique coordinates: {len(unique_coords)}\n"
+                   f"Max density: {max_count} points",
+                   bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
+        
+        # Add a legend
+        plt.legend(loc='upper right')
+        
+        # Add percentile values table
+        table_text = []
+        for i, p in enumerate(percentiles):
+            table_text.append([f"{p}th", f"{x_percentiles[i]:.2f}", f"{y_percentiles[i]:.2f}"])
+        
+        the_table = plt.table(cellText=table_text,
+                             colLabels=['Percentile', 'X Value', 'Y Value'],
+                             loc='upper left', bbox=[0.0, 0.8, 0.3, 0.2])
+        the_table.auto_set_font_size(False)
+        the_table.set_fontsize(9)
+        
+        # Save the plot
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        
+        logger.info(f"Mouse delta scatter plot saved to {output_path}")
+        return output_path
+
+    def generate_mouse_scroll_scatter_plot(self, output_path=None, percentiles=[5, 25, 50, 75, 95]):
+        """
+        Generate a scatter plot of mouse scroll events with percentile bars and density-based point sizing.
+        
+        Args:
+            output_path: Path to save the plot image. If None, will save to the output directory.
+            percentiles: List of percentiles to show as horizontal and vertical bars.
+            
+        Returns:
+            Path to the saved plot image.
+        """
+        if not output_path:
+            output_path = os.path.join(self.output_dir, "mouse_scroll_scatter.png")
+        
+        # Extract all scroll events
+        scroll_events = [event for event in self.events if isinstance(event, ScrollEvent)]
+        if not scroll_events:
+            logger.error("No scroll events found, cannot create mouse scroll scatter plot")
+            return None
+        
+        # Extract scroll values
+        scroll_x_values = [event.scroll_x for event in scroll_events]
+        scroll_y_values = [event.scroll_y for event in scroll_events]
+        
+        # Calculate percentiles for both axes
+        x_percentiles = np.percentile(scroll_x_values, percentiles)
+        y_percentiles = np.percentile(scroll_y_values, percentiles)
+        
+        # Create the scatter plot
+        plt.figure(figsize=(12, 12))
+        
+        # Create a symmetric log scale for better visualization of small and large values
+        plt.xscale('symlog', linthresh=1)  # Linear scale for -1 < x < 1, log scale elsewhere
+        plt.yscale('symlog', linthresh=1)  # Linear scale for -1 < y < 1, log scale elsewhere
+        
+        # Plot the grid centered at 0,0
+        plt.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+        plt.axvline(x=0, color='gray', linestyle='-', alpha=0.5)
+        
+        # Add percentile lines for x-axis
+        for i, p in enumerate(percentiles):
+            plt.axvline(x=x_percentiles[i], color='red', linestyle='--', alpha=0.5, 
+                       label=f'X {p}th percentile: {x_percentiles[i]:.2f}' if i == 0 else "")
+        
+        # Add percentile lines for y-axis
+        for i, p in enumerate(percentiles):
+            plt.axhline(y=y_percentiles[i], color='blue', linestyle='--', alpha=0.5,
+                       label=f'Y {p}th percentile: {y_percentiles[i]:.2f}' if i == 0 else "")
+        
+        # Round values to group nearby points
+        # Lower decimals = more aggressive grouping
+        decimals = 0  # Scroll values are integers, so no need for decimals
+        coords = [(round(x, decimals), round(y, decimals)) for x, y in zip(scroll_x_values, scroll_y_values)]
+        
+        # Count occurrences of each coordinate pair
+        coord_counts = Counter(coords)
+        
+        # Extract unique coordinates and their counts
+        unique_coords = list(coord_counts.keys())
+        counts = list(coord_counts.values())
+        
+        # Convert to arrays for plotting
+        x_coords = [coord[0] for coord in unique_coords]
+        y_coords = [coord[1] for coord in unique_coords]
+        
+        # Scale marker sizes based on counts
+        # Use a non-linear scaling to make differences more visible
+        min_size = 10
+        max_size = 500
+        min_count = min(counts) if counts else 1
+        max_count = max(counts) if counts else 1
+        
+        # Use a logarithmic scale for better visibility of size differences
+        if max_count > min_count:
+            sizes = [min_size + (max_size - min_size) * (np.log(count) - np.log(min_count)) / 
+                    (np.log(max_count) - np.log(min_count)) for count in counts]
+        else:
+            sizes = [min_size for _ in counts]
+        
+        # Create scatter plot with size and color representing density
+        scatter = plt.scatter(x_coords, y_coords, s=sizes, alpha=0.5, 
+                             c=counts, cmap='viridis', edgecolors='none')
+        
+        # Add a colorbar to show the count scale
+        cbar = plt.colorbar(scatter, label='Point Density')
+        
+        # Set plot limits to ensure it's centered and includes the data
+        max_abs_x = max(abs(min(scroll_x_values)), abs(max(scroll_x_values)))
+        max_abs_y = max(abs(min(scroll_y_values)), abs(max(scroll_y_values)))
+        max_abs = max(max_abs_x, max_abs_y) * 1.1  # Add 10% margin
+        plt.xlim(-max_abs, max_abs)
+        plt.ylim(-max_abs, max_abs)
+        
+        # Add labels and title
+        plt.title('Mouse Scroll Values with Density-Based Sizing (Log Scale)')
+        plt.xlabel('Scroll X (symlog scale)')
+        plt.ylabel('Scroll Y (symlog scale)')
+        
+        # Add statistical information to the plot
+        plt.figtext(0.02, 0.02, 
+                   f"X range: [{min(scroll_x_values)}, {max(scroll_x_values)}]\n"
+                   f"Y range: [{min(scroll_y_values)}, {max(scroll_y_values)}]\n"
+                   f"X median: {np.median(scroll_x_values)}\n"
+                   f"Y median: {np.median(scroll_y_values)}\n"
+                   f"Total points: {len(scroll_x_values)}\n"
+                   f"Unique coordinates: {len(unique_coords)}\n"
+                   f"Max density: {max_count} points",
+                   bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
+        
+        # Add a legend
+        plt.legend(loc='upper right')
+        
+        # Add percentile values table
+        table_text = []
+        for i, p in enumerate(percentiles):
+            table_text.append([f"{p}th", f"{x_percentiles[i]:.2f}", f"{y_percentiles[i]:.2f}"])
+        
+        the_table = plt.table(cellText=table_text,
+                             colLabels=['Percentile', 'X Value', 'Y Value'],
+                             loc='upper left', bbox=[0.0, 0.8, 0.3, 0.2])
+        the_table.auto_set_font_size(False)
+        the_table.set_fontsize(9)
+        
+        # Save the plot
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        
+        logger.info(f"Mouse scroll scatter plot saved to {output_path}")
         return output_path
 
     def print_analytics(self, save_plots=False):
@@ -742,12 +1369,6 @@ class Timeline:
                     heatmap_path = self.generate_patch_heatmap()
                     if heatmap_path:
                         print(f"   Patch activity heatmap saved to {COLORS['highlight']}{os.path.basename(heatmap_path)}{COLORS['normal']}")
-            
-            # Render reconstructed video if requested
-            if save_plots:
-                video_path = self.render_reconstructed_video(highlight_active=True)
-                if video_path:
-                    print(f"   Reconstructed video saved to {COLORS['highlight']}{os.path.basename(video_path)}{COLORS['normal']} (with orange overlay on active patches)")
         else:
             print(f"   {COLORS['warning']}No patching analytics available{COLORS['normal']}")
         
@@ -957,6 +1578,11 @@ class Timeline:
                 plt.grid(True)
                 plt.savefig(os.path.join(self.output_dir, 'mouse_path.png'))
                 plt.close()
+                
+                # Generate mouse delta scatter plot
+                delta_plot_path = self.generate_mouse_delta_scatter_plot()
+                if delta_plot_path:
+                    print(f"   Mouse delta scatter plot saved to {COLORS['highlight']}{os.path.basename(delta_plot_path)}{COLORS['normal']}")
         
         # ScrollEvent analysis
         scroll_events = [event for event in self.events if isinstance(event, ScrollEvent)]
@@ -989,6 +1615,12 @@ class Timeline:
             
             if scroll_y_values:
                 print(f"   scroll_y - min: {COLORS['value']}{min(scroll_y_values)}{COLORS['normal']}, max: {COLORS['value']}{max(scroll_y_values)}{COLORS['normal']}, mean: {COLORS['value']}{sum(scroll_y_values)/len(scroll_y_values):.2f}{COLORS['normal']}")
+            
+            # Generate scroll scatter plot if save_plots is enabled
+            if save_plots:
+                scroll_plot_path = self.generate_mouse_scroll_scatter_plot()
+                if scroll_plot_path:
+                    print(f"   Mouse scroll scatter plot saved to {COLORS['highlight']}{os.path.basename(scroll_plot_path)}{COLORS['normal']}")
         
         # PressEvent analysis
         press_events = [event for event in self.events if isinstance(event, PressEvent)]
@@ -1002,8 +1634,13 @@ class Timeline:
             
             # Show most common keys
             print(f"{COLORS['subheader']}   Most common keys:{COLORS['normal']}")
+            # Group events by key to access the readable property
+            events_by_key = defaultdict(list)
+            for event in press_events:
+                events_by_key[event.key].append(event)
+            
             for key, count in key_counts.most_common(10):
-                key_name = SPECIAL_KEYS_REVERSE.get(key, f"Key {key}")
+                key_name = events_by_key[key][0].readable
                 print(f"     {COLORS['highlight']}{key_name}{COLORS['normal']}: {COLORS['value']}{count}{COLORS['normal']} times")
             
             # Check down/up balance
@@ -1128,7 +1765,7 @@ class Timeline:
                 time_indicator = f"+{rel_time}ms" if rel_time > 0 else "0ms"
                 
                 if isinstance(event, TimelinePressEvent):
-                    key_name = SPECIAL_KEYS_REVERSE.get(event.key, f"Key {event.key}")
+                    key_name = f"Key {event.readable}"
                     action = "pressed" if event.down else "released"
                     event_texts.append(f"• {key_name} {action} [{time_indicator}]")
                 elif isinstance(event, PositionEvent):
@@ -1194,8 +1831,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-events-overlay", action="store_true", help="Disable keyboard and mouse events overlay on the reconstructed video")
     parser.add_argument("--no-srt", action="store_true", help="Disable generation of SRT subtitle file with keyboard and mouse events grouped by frame")
     
-    parser.add_argument("--highlight-color", type=str, default="orange", help="Color for highlighting active patches (orange, red, blue, yellow, cyan, magenta, green)")
-    parser.add_argument("--highlight-opacity", type=float, default=0.3, help="Opacity of the highlight overlay (0.0 to 1.0)")
+    parser.add_argument("--highlight-color", type=str, default="blue", help="Color for highlighting active patches (orange, red, blue, yellow, cyan, magenta, green)")
+    parser.add_argument("--highlight-opacity", type=float, default=0.1, help="Opacity of the highlight overlay (0.0 to 1.0)")
     parser.add_argument("--srt-filename", type=str, default="timeline.srt", help="Filename for the generated SRT file (default: timeline.srt)")
     parser.add_argument("--srt-fps", type=float, default=30.0, help="Frame rate to use for SRT timecodes (default: auto-detect from video, fallback to 30.0)")
     args = parser.parse_args()
