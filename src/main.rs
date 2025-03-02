@@ -145,6 +145,7 @@ impl Session {
 
     fn stop(self) {
         println!("{}", "Stopping recording session...".yellow());
+        self.should_run.store(false, Ordering::SeqCst);
 
         let session_dir = self.session_dir.clone();
         
@@ -283,191 +284,179 @@ fn check_for_running_instance() -> Result<std::fs::File, String> {
 }
 
 pub fn main() -> Result<()> {
-    let _lock_file = match check_for_running_instance() {
-        Ok(file) => file,
-        Err(e) => {
-            eprintln!("{}", format!("Error: {}", e).bright_red().bold());
-            eprintln!("{}", "Please close any other running instances of Loggy3 before starting a new one.".yellow());
-            std::process::exit(1);
-        }
-    };
-    
-    let args: Vec<String> = std::env::args().collect();
-    let verbose_mode = args.iter().any(|arg| arg == "--verbose" || arg == "-v");
-    let force_update = args.iter().any(|arg| arg == "--force-update" || arg == "-u");
-    
-    if verbose_mode {
-        VERBOSE.store(true, Ordering::SeqCst);
-    }
-    #[cfg(target_os = "windows")] {
-        if let Err(e) = platform::check_windows_version_compatibility() {
-            eprintln!("Error: {}", e);
-            return Err(anyhow::anyhow!("Incompatible Windows version: {}", e));
-        }
-        
-        if let Ok(version_type) = platform::get_windows_version_type() {
-            match version_type {
-                platform::WindowsVersionType::Windows10 => {
-                    println!("Running on Windows 10");
-                    colored::control::set_override(false);
-                },
-                platform::WindowsVersionType::Windows11 => {
-                    println!("Running on Windows 11");
-                },
-                _ => {}
+    loop {
+        let _lock_file = match check_for_running_instance() {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("{}", format!("Error: {}", e).bright_red().bold());
+                eprintln!("{}", "Please close any other running instances of Loggy3 before starting a new one.".yellow());
+                std::process::exit(1);
             }
-        } else {
-            eprintln!("Error: Could not determine Windows version");
-        }
-    }
-    
-    println!("{} {}", "\nLoggy3 Screen Recorder".bright_green().bold(), 
-              format!("v{}", CURRENT_VERSION).bright_cyan());
-    println!("{}", "======================".bright_green());
-    println!("{}", "Usage:".bright_yellow());
-    println!("{}", "  --verbose, -v       Enable verbose output".bright_black());
-    println!("{}", "  --force-update, -u  Force update to latest version".bright_black());
-    println!("");
-
-    let user_id = match get_or_create_user_id() {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("Warning: Failed to get/create user ID: {}", e);
-            "unknown".to_string()
-        }
-    };
-    
-    if let Ok(mut user_id_guard) = USER_ID.lock() {
-        *user_id_guard = user_id.clone();
-    }
-    
-    println!("{} {}", "User ID:".bright_yellow(), user_id.bright_cyan());
-    
-    if VERBOSE.load(Ordering::SeqCst) {
-        println!("{}", "Verbose output enabled".yellow());
-    }
-    
-    println!("{}", "Checking for updates...".cyan());
-    
-    if let Some((version, download_url, release_url)) = check_for_updates(force_update) {
-        if force_update && version == CURRENT_VERSION {
-            println!("{} {} {} {}", 
-                "Forcing update to version".bright_yellow(),
-                version.bright_green().bold(),
-                "(same as current version)".bright_yellow(),
-                ""
-            );
-        } else {
-            println!("{} {} {} {}", 
-                "A new version".bright_yellow(),
-                version.bright_green().bold(),
-                "is available!".bright_yellow(),
-                format!("(current: {})", CURRENT_VERSION).bright_black()
-            );
-        }
+        };
         
-        println!("Release page: {}", release_url.bright_blue().underline());
+        let args: Vec<String> = std::env::args().collect();
+        let verbose_mode = args.iter().any(|arg| arg == "--verbose" || arg == "-v");
+        let force_update = args.iter().any(|arg| arg == "--force-update" || arg == "-u");
         
-        if force_update {
-            println!("\nForce update flag is set. Updating automatically...");
-            update_to_new_version(&download_url)?;
-        } else {
-            println!("\nWould you like to update now? [Y/n] ");
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
+        if verbose_mode {
+            VERBOSE.store(true, Ordering::SeqCst);
+        }
+        #[cfg(target_os = "windows")] {
+            if let Err(e) = platform::check_windows_version_compatibility() {
+                eprintln!("Error: {}", e);
+                return Err(anyhow::anyhow!("Incompatible Windows version: {}", e));
+            }
             
-            match input.trim().to_lowercase().as_str() {
-                "y" | "yes" | "" => {
-                    update_to_new_version(&download_url)?;
+            if let Ok(version_type) = platform::get_windows_version_type() {
+                match version_type {
+                    platform::WindowsVersionType::Windows10 => {
+                        println!("Running on Windows 10");
+                        colored::control::set_override(false);
+                    },
+                    platform::WindowsVersionType::Windows11 => {
+                        println!("Running on Windows 11");
+                    },
+                    _ => {}
                 }
-                _ => {
-                    println!("{}", "Update skipped. The application will continue to run.".yellow());
-                }
+            } else {
+                eprintln!("Error: Could not determine Windows version");
             }
         }
-    } else if force_update {
-        println!("{}", "Force update requested but no update is available.".yellow());
-    } else if VERBOSE.load(Ordering::SeqCst) {
-        println!("{}", "You're running the latest version!".green());
-    }
-
-    println!("\n{}", "Checking system permissions...".bright_black());
-    if let Err(e) = platform::check_and_request_permissions() {
-        eprintln!("Error checking permissions: {}", e);
-        println!("{}", "Loggy3 cannot run without the required permissions. Please restart after granting permissions.".bright_red().bold());
-        return Err(anyhow::anyhow!("Missing required permissions: {}", e));
-    }
-
-    if let Err(e) = platform::set_path_or_start_menu_shortcut() {
-        eprintln!("{}", e);
-    }
-
-    let should_run = Arc::new(AtomicBool::new(true));
-
-    let sr_for_signals = should_run.clone();
-    thread::spawn(move || {
-        let (tx, rx) = channel();
         
-        set_handler(move || tx.send(()).expect("Could not send signal on channel."))
-            .expect("Error setting Ctrl-C handler");
-        
-        println!("\n{}", "Press Ctrl-C to stop recording...".bright_yellow());
-        rx.recv().expect("Could not receive from channel.");
-        println!("\n{}", "Stopping recording, wait a few seconds...".yellow()); 
-        
-        sr_for_signals.store(false, Ordering::SeqCst);
-    });
-    
-    let mut last_display_fingerprint = String::new();
+        println!("{} {}", "\nLoggy3 Screen Recorder".bright_green().bold(), 
+                format!("v{}", CURRENT_VERSION).bright_cyan());
+        println!("{}", "======================".bright_green());
+        println!("{}", "Usage:".bright_yellow());
+        println!("{}", "  --verbose, -v       Enable verbose output".bright_black());
+        println!("{}", "  --force-update, -u  Force update to latest version".bright_black());
+        println!("");
 
-    while should_run.load(Ordering::SeqCst) {
-        let current_fingerprint = get_display_fingerprint();
-        let displays_changed = current_fingerprint != last_display_fingerprint;
+        let user_id = match get_or_create_user_id() {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("Warning: Failed to get/create user ID: {}", e);
+                "unknown".to_string()
+            }
+        };
         
-        if displays_changed && !last_display_fingerprint.is_empty() {
-            println!("{}", "Display configuration changed!".bright_yellow().bold());
+        if let Ok(mut user_id_guard) = USER_ID.lock() {
+            *user_id_guard = user_id.clone();
         }
         
-        last_display_fingerprint = current_fingerprint.clone();
+        println!("{} {}", "User ID:".bright_yellow(), user_id.bright_cyan());
+        
+        if VERBOSE.load(Ordering::SeqCst) {
+            println!("{}", "Verbose output enabled".yellow());
+        }
+        
+        println!("{}", "Checking for updates...".cyan());
+        
+        if let Some((version, download_url, release_url)) = check_for_updates(force_update) {
+            if force_update && version == CURRENT_VERSION {
+                println!("{} {} {} {}", 
+                    "Forcing update to version".bright_yellow(),
+                    version.bright_green().bold(),
+                    "(same as current version)".bright_yellow(),
+                    ""
+                );
+            } else {
+                println!("{} {} {} {}", 
+                    "A new version".bright_yellow(),
+                    version.bright_green().bold(),
+                    "is available!".bright_yellow(),
+                    format!("(current: {})", CURRENT_VERSION).bright_black()
+                );
+            }
+            
+            println!("Release page: {}", release_url.bright_blue().underline());
+            
+            if force_update {
+                println!("\nForce update flag is set. Updating automatically...");
+                update_to_new_version(&download_url)?;
+            } else {
+                println!("\nWould you like to update now? [Y/n] ");
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                
+                match input.trim().to_lowercase().as_str() {
+                    "y" | "yes" | "" => {
+                        update_to_new_version(&download_url)?;
+                    }
+                    _ => {
+                        println!("{}", "Update skipped. The application will continue to run.".yellow());
+                    }
+                }
+            }
+        } else if force_update {
+            println!("{}", "Force update requested but no update is available.".yellow());
+        } else if VERBOSE.load(Ordering::SeqCst) {
+            println!("{}", "You're running the latest version!".green());
+        }
 
-        match Session::new(should_run.clone())? {
-            Some(mut session) => {
-                session.start();
+        println!("\n{}", "Checking system permissions...".bright_black());
+        if let Err(e) = platform::check_and_request_permissions() {
+            eprintln!("Error checking permissions: {}", e);
+            println!("{}", "Loggy3 cannot run without the required permissions. Please restart after granting permissions.".bright_red().bold());
+            return Err(anyhow::anyhow!("Missing required permissions: {}", e));
+        }
 
-                while should_run.load(Ordering::SeqCst) {
-                    let need_restart = session.check_for_errors();
-                    if need_restart {
-                        println!("{}", "Session signaled a critical error. Restarting session.".red());
-                        break;
+        if let Err(e) = platform::set_path_or_start_menu_shortcut() {
+            eprintln!("{}", e);
+        }
+
+        let should_run = Arc::new(AtomicBool::new(true));
+        
+        let mut last_display_fingerprint = String::new();
+
+        while should_run.load(Ordering::SeqCst) {
+            let current_fingerprint = get_display_fingerprint();
+            let displays_changed = current_fingerprint != last_display_fingerprint;
+            
+            if displays_changed && !last_display_fingerprint.is_empty() {
+                println!("{}", "Display configuration changed!".bright_yellow().bold());
+            }
+            
+            last_display_fingerprint = current_fingerprint.clone();
+
+            match Session::new(should_run.clone())? {
+                Some(mut session) => {
+                    session.start();
+
+                    while should_run.load(Ordering::SeqCst) {
+                        let need_restart = session.check_for_errors();
+                        if need_restart {
+                            println!("{}", "Session signaled a critical error. Restarting session.".red());
+                            break;
+                        }
+
+                        let current = get_display_fingerprint();
+                        if current != current_fingerprint {
+                            println!("{}", "Display configuration changed. Stopping current session...".yellow());
+                            break;
+                        }
+
+                        thread::sleep(Duration::from_secs(1));
                     }
 
-                    let current = get_display_fingerprint();
-                    if current != current_fingerprint {
-                        println!("{}", "Display configuration changed. Stopping current session...".yellow());
+                    session.stop();
+                    
+                    if !should_run.load(Ordering::SeqCst) {
                         break;
                     }
-
+                    
                     thread::sleep(Duration::from_secs(1));
                 }
-
-                session.stop();
-                
-                if !should_run.load(Ordering::SeqCst) {
-                    break;
+                None => {
+                    if displays_changed {
+                        println!("{}", "All displays disconnected. Waiting for displays to be connected...".yellow());
+                    }
+                    thread::sleep(Duration::from_secs(10));
                 }
-                
-                thread::sleep(Duration::from_secs(1));
-            }
-            None => {
-                if displays_changed {
-                    println!("{}", "All displays disconnected. Waiting for displays to be connected...".yellow());
-                }
-                thread::sleep(Duration::from_secs(10));
             }
         }
-    }
 
-    println!("{}", "Recording stopped. Thank you for using Loggy3!".green().bold());
+        println!("{}", "Recording stopped. Thank you for using Loggy3!".green().bold());
+    }
     
     Ok(())
 }
