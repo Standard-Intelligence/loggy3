@@ -101,7 +101,7 @@ SPECIAL_KEYS = {
     "RightMouse": 138,   
 }
 
-PATCH_SIZE = 10
+PATCH_SIZE = 64
 
 def timeline_to_computer_events(timeline_events: List[FrameEvent | PositionEvent | TimelineScrollEvent | TimelinePressEvent]) -> List[ComputerEvent]:
     logger.info(f"Converting {len(timeline_events)} timeline events to computer events")
@@ -193,6 +193,15 @@ def collect_timeline_analytics(timeline_events: List[FrameEvent | PositionEvent 
                 frame_count += 1
                 pixels = event.pixels.float()
                 logger.debug(f"Processing frame {frame_count} with shape {pixels.shape}")
+                
+                # Handle non-divisible dimensions by cropping to the nearest multiple of PATCH_SIZE
+                orig_h, orig_w = pixels.shape[0], pixels.shape[1]
+                new_h = (orig_h // PATCH_SIZE) * PATCH_SIZE
+                new_w = (orig_w // PATCH_SIZE) * PATCH_SIZE
+                
+                if new_h != orig_h or new_w != orig_w:
+                    logger.info(f"Cropping frame from {orig_h}x{orig_w} to {new_h}x{new_w} to be divisible by patch size {PATCH_SIZE}")
+                    pixels = pixels[:new_h, :new_w, :]
                 
                 # Calculate grid dimensions for logging
                 grid_height = pixels.shape[0] // PATCH_SIZE
