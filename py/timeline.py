@@ -357,82 +357,182 @@ class Timeline:
         return [FrameEvent(seq=seq, time=time, pixels=frame) for (seq, time), frame in zip(timings, frames)]
     
     def load_keypresses(self, keypresses_log: str) -> List[TimelinePressEvent]:
-        keypress_raws = []
+        import re
+        keypress_events = []
+        
         with open(keypresses_log, "r") as f:
             for line in f:
-                keypress_raws.append(eval(line.strip()))
-        keypress_timings = []
-        keypress_jsons = []
-        for keypress_raw in keypress_raws:
-            seq, _, monotonic_time = keypress_raw[0]
-            keypress_timings.append((seq, monotonic_time))
-            keypress_jsons.append(json.loads(keypress_raw[1]))
-        assert len(keypress_timings) == len(keypress_jsons)
-
-        keypress_types: List[Tuple[int, bool, str]] = []
-        for keypress_json in keypress_jsons:
-            match keypress_json["type"]:
-                case "key_down":
-                    keypress_types.append((keypress_json["keycode"], True, keypress_json["keycodeStr"]))
-                case "key_up":
-                    keypress_types.append((keypress_json["keycode"], False, keypress_json["keycodeStr"]))
-                case "flags_changed":
-                    if len(keypress_json["flagsChanged"].keys()) != 1: 
-                        logger.warning(f"Expected only one key in flagsChanged, but got {keypress_json['flagsChanged'].keys()}")
-                    flag_key, flag_value = next(iter(keypress_json["flagsChanged"].items()))
-                    is_pressed = flag_value == "pressed"
-                    keypress_types.append((SPECIAL_KEYS[flag_key], is_pressed, flag_key))
-                case _:
-                    raise ValueError(f"Unknown keypress type: {keypress_json['type']}")
-        assert len(keypress_timings) == len(keypress_types)
-
-        return [TimelinePressEvent(
-            seq=seq, 
-            time=monotonic_time, 
-            key=key, 
-            down=down, 
-            readable=readable) for (seq, monotonic_time), (key, down, readable) in zip(keypress_timings, keypress_types)]
+                line = line.strip()
+                # Handle Windows format with regex - matches the exact format from example
+                match = re.match(r'\[\((\d+), (\d+), (\d+)\), \'\'([^\']+)\', \'([^\']+)\'\'\]', line)
+                if match:
+                    # Windows format with double single quotes
+                    seq = int(match.group(1))
+                    timestamp = int(match.group(2))
+                    relative_time = int(match.group(3))
+                    action = match.group(4)
+                    vk_code = match.group(5)
+                    
+                    # Convert to our internal format
+                    keycode = int(vk_code.replace("VK_", ""))
+                    is_down = action == "press"
+                    
+                    keypress_events.append(TimelinePressEvent(
+                        seq=seq,
+                        time=relative_time,
+                        key=keycode,
+                        down=is_down,
+                        readable=vk_code
+                    ))
+                else:
+                    try:
+                        # Try Mac format
+                        keypress_raw = eval(line)
+                        seq, _, monotonic_time = keypress_raw[0]
+                        keypress_json = json.loads(keypress_raw[1])
+                        
+                        if keypress_json["type"] == "key_down":
+                            keypress_events.append(TimelinePressEvent(
+                                seq=seq,
+                                time=monotonic_time,
+                                key=keypress_json["keycode"],
+                                down=True,
+                                readable=keypress_json["keycodeStr"]
+                            ))
+                        elif keypress_json["type"] == "key_up":
+                            keypress_events.append(TimelinePressEvent(
+                                seq=seq,
+                                time=monotonic_time,
+                                key=keypress_json["keycode"],
+                                down=False,
+                                readable=keypress_json["keycodeStr"]
+                            ))
+                        elif keypress_json["type"] == "flags_changed":
+                            if len(keypress_json["flagsChanged"].keys()) != 1:
+                                logger.warning(f"Expected only one key in flagsChanged, but got {keypress_json['flagsChanged'].keys()}")
+                            flag_key, flag_value = next(iter(keypress_json["flagsChanged"].items()))
+                            is_pressed = flag_value == "pressed"
+                            keypress_events.append(TimelinePressEvent(
+                                seq=seq,
+                                time=monotonic_time,
+                                key=SPECIAL_KEYS[flag_key],
+                                down=is_pressed,
+                                readable=flag_key
+                            ))
+                    except Exception as e:
+                        logger.warning(f"Failed to parse keypress line: {e}. Raw line: {line}")
+                        continue
+        
+        return keypress_events
 
     def load_mouse(self, mouse_log: str) -> List[Union[PositionEvent, TimelineScrollEvent, TimelinePressEvent]]:
-        mouse_raws = []
+        import re
+        mouse_events = []
+        
         with open(mouse_log, "r") as f:
             for line in f:
-                mouse_raws.append(eval(line.strip()))
-        mouse_timings = []
-        mouse_jsons = []
-        for mouse_raw in mouse_raws:
-            seq, _, monotonic_time = mouse_raw[0]
-            mouse_timings.append((seq, monotonic_time))
-            mouse_jsons.append(json.loads(mouse_raw[1]))
-        assert len(mouse_timings) == len(mouse_jsons)
-
-        mouse_types: List[Union[Tuple[str, float, float], Tuple[str, int, bool, str], Tuple[str, int, int]]] = []
-        for mouse_json in mouse_jsons:
-            match mouse_json["type"]:
-                case "mouse_movement":
-                    mouse_types.append(('position', mouse_json["location"]["x"], mouse_json["location"]["y"], mouse_json["deltaX"], mouse_json["deltaY"]))
-                case "mouse_down":
-                    mouse_code = SPECIAL_KEYS[mouse_json["eventType"].replace("Down", "")]
-                    mouse_types.append(('press', mouse_code, True, mouse_json["eventType"].replace("Down", "")))
-                case "mouse_up":
-                    mouse_code = SPECIAL_KEYS[mouse_json["eventType"].replace("Up", "")]
-                    mouse_types.append(('press', mouse_code, False, mouse_json["eventType"].replace("Up", "")))
-                case "scroll_wheel":
-                    mouse_types.append(('scroll', mouse_json["pointDeltaAxis1"], mouse_json["pointDeltaAxis2"]))
-                case _:
-                    raise ValueError(f"Unknown mouse type: {mouse_json['type']}")
-        assert len(mouse_timings) == len(mouse_types)
-
-        events = []
-        for (seq, monotonic_time), (event_type, *args) in zip(mouse_timings, mouse_types):
-            match event_type:
-                case 'position':
-                    events.append(PositionEvent(seq=seq, time=monotonic_time, x=args[0], y=args[1], delta_x=args[2], delta_y=args[3]))
-                case 'press':
-                    events.append(TimelinePressEvent(seq=seq, time=monotonic_time, key=int(args[0]), down=bool(args[1]), readable=args[2]))
-                case 'scroll':
-                    events.append(TimelineScrollEvent(seq=seq, time=monotonic_time, scroll_x=int(args[0]), scroll_y=int(args[1])))
-        return events
+                line = line.strip()
+                
+                # Handle Windows format with regex - matches the exact format from example
+                match = re.match(r'\[\((\d+), (\d+), (\d+)\), \'(.*)\'\]', line)
+                if match:
+                    # Windows format from example
+                    seq = int(match.group(1))
+                    timestamp = int(match.group(2))
+                    relative_time = int(match.group(3))
+                    json_str = match.group(4).replace('\\"', '"')
+                    
+                    try:
+                        mouse_json = json.loads(json_str)
+                        
+                        if mouse_json["type"] == "Delta":
+                            # Mouse movement
+                            delta_x = float(mouse_json.get("deltaX", 0))
+                            delta_y = float(mouse_json.get("deltaY", 0))
+                            mouse_events.append(PositionEvent(
+                                seq=seq,
+                                time=relative_time,
+                                x=0.0,  # Windows doesn't provide absolute positions
+                                y=0.0,
+                                delta_x=delta_x,
+                                delta_y=delta_y
+                            ))
+                        elif mouse_json["type"] == "Wheel":
+                            # Mouse scroll
+                            scroll_x = int(mouse_json.get("deltaX", 0))
+                            scroll_y = int(mouse_json.get("deltaY", 0))
+                            mouse_events.append(TimelineScrollEvent(
+                                seq=seq,
+                                time=relative_time,
+                                scroll_x=scroll_x,
+                                scroll_y=scroll_y
+                            ))
+                        elif mouse_json["type"] == "Button":
+                            # Mouse button
+                            button_map = {
+                                "Left": "LeftMouse",
+                                "Right": "RightMouse",
+                                "Middle": "MiddleMouse"
+                            }
+                            button_name = button_map.get(mouse_json.get("button", ""), "UnknownMouse")
+                            mouse_code = SPECIAL_KEYS.get(button_name, 0)
+                            is_down = mouse_json.get("action", "") == "press"
+                            mouse_events.append(TimelinePressEvent(
+                                seq=seq,
+                                time=relative_time,
+                                key=mouse_code,
+                                down=is_down,
+                                readable=button_name
+                            ))
+                    except Exception as e:
+                        logger.warning(f"Failed to parse mouse JSON: {e}. JSON: {json_str}")
+                        continue
+                else:
+                    try:
+                        # Try Mac format
+                        mouse_raw = eval(line)
+                        seq, _, monotonic_time = mouse_raw[0]
+                        mouse_json = json.loads(mouse_raw[1])
+                        
+                        if mouse_json["type"] == "mouse_movement":
+                            mouse_events.append(PositionEvent(
+                                seq=seq,
+                                time=monotonic_time,
+                                x=mouse_json["location"]["x"],
+                                y=mouse_json["location"]["y"],
+                                delta_x=mouse_json["deltaX"],
+                                delta_y=mouse_json["deltaY"]
+                            ))
+                        elif mouse_json["type"] == "mouse_down":
+                            mouse_code = SPECIAL_KEYS[mouse_json["eventType"].replace("Down", "")]
+                            mouse_events.append(TimelinePressEvent(
+                                seq=seq,
+                                time=monotonic_time,
+                                key=mouse_code,
+                                down=True,
+                                readable=mouse_json["eventType"].replace("Down", "")
+                            ))
+                        elif mouse_json["type"] == "mouse_up":
+                            mouse_code = SPECIAL_KEYS[mouse_json["eventType"].replace("Up", "")]
+                            mouse_events.append(TimelinePressEvent(
+                                seq=seq,
+                                time=monotonic_time,
+                                key=mouse_code,
+                                down=False,
+                                readable=mouse_json["eventType"].replace("Up", "")
+                            ))
+                        elif mouse_json["type"] == "scroll_wheel":
+                            mouse_events.append(TimelineScrollEvent(
+                                seq=seq,
+                                time=monotonic_time,
+                                scroll_x=mouse_json["pointDeltaAxis1"],
+                                scroll_y=mouse_json["pointDeltaAxis2"]
+                            ))
+                    except Exception as e:
+                        logger.warning(f"Failed to parse mouse line: {e}. Raw line: {line}")
+                        continue
+        
+        return mouse_events
 
     def __len__(self):
         return len(self.events)
