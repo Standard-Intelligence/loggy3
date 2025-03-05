@@ -4,3 +4,4 @@ torch
 einops
 numpy
 opencv-python
+maturin>=1.2.0
