@@ -5,7 +5,7 @@ use std::path::Path;
 mod tokens;
 
 #[pyfunction]
-fn chunk_tokenizer(chunk_path: &str, os_type: &str) -> PyResult<Vec<(usize, usize)>> {
+fn chunk_tokenizer(chunk_path: &str, os_type: Option<&str>) -> PyResult<Vec<(usize, usize)>> {
     let path = Path::new(chunk_path);
     Ok(tokens::chunk_tokenizer(path, os_type))
 }

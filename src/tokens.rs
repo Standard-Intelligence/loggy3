@@ -8,7 +8,11 @@ maturin develop
 ```python
 from loggy3 import chunk_tokenizer
 
+# Specify platform explicitly
 tokens = chunk_tokenizer("/path/to/chunk_directory", "Mac")  # or "Windows"
+
+# Or use auto-detection
+tokens = chunk_tokenizer("/path/to/chunk_directory", None)  # Will auto-detect platform from log structure
 
 for seq, token in tokens:
     print(f"Sequence: {seq}, Token: {token}")
@@ -126,10 +130,92 @@ enum_with_count! {
     } count=COUNT_OF_VARIANTS
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum Platform {
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum Platform {
     Mac,
     Windows,
+}
+
+impl Platform {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Platform::Mac => "Mac",
+            Platform::Windows => "Windows",
+        }
+    }
+    
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "Mac" => Some(Platform::Mac),
+            "Windows" => Some(Platform::Windows),
+            _ => None,
+        }
+    }
+    
+    // Automatically detect platform from log file structure
+    pub fn detect_from_logs(chunk_path: &std::path::Path) -> Option<Self> {
+        let keypresses_path = chunk_path.join("keypresses.log");
+        if keypresses_path.exists() {
+            if let Ok(keylog) = std::fs::read_to_string(&keypresses_path) {
+                if keylog.is_empty() {
+                    return None;
+                }
+                
+                // Check for Mac-specific patterns
+                if keylog.contains("\"keycode\": ") && 
+                   (keylog.contains("\"type\": \"keyDown\"") || 
+                    keylog.contains("\"type\": \"keyUp\"") || 
+                    keylog.contains("\"flagsChanged\":")) {
+                    return Some(Platform::Mac);
+                }
+                
+                // Check for Windows-specific patterns
+                if keylog.contains("vkey: ") && 
+                   (keylog.contains("press") || keylog.contains("release")) {
+                    return Some(Platform::Windows);
+                }
+                
+                // Additional Windows pattern check for VK_ key codes
+                if keylog.contains("'press'") || keylog.contains("'release'") {
+                    if keylog.contains("'VK_") {
+                        return Some(Platform::Windows);
+                    }
+                }
+            }
+        }
+        
+        // If keylog doesn't give conclusive results, check mouse log
+        let mouselog_path = chunk_path.join("mouse.log");
+        if mouselog_path.exists() {
+            if let Ok(mouselog) = std::fs::read_to_string(&mouselog_path) {
+                if mouselog.is_empty() {
+                    return None;
+                }
+                
+                // Mac mouse logs contain locationInWindow, buttons, etc.
+                if mouselog.contains("\"type\": \"leftMouseDown\"") || 
+                   mouselog.contains("\"locationInWindow\": {") {
+                    return Some(Platform::Mac);
+                }
+                
+                // Windows mouse logs have a different format
+                if mouselog.contains("button: ") && 
+                   (mouselog.contains("press") || mouselog.contains("release") || 
+                    mouselog.contains("move") || mouselog.contains("wheel")) {
+                    return Some(Platform::Windows);
+                }
+                
+                // Additional JSON format check with type field and deltaX/deltaY
+                if mouselog.contains("\"type\":") && 
+                   (mouselog.contains("\"deltaX\":") || mouselog.contains("\"deltaY\":")) {
+                    // This appears to be a Windows-style JSON mouse log
+                    return Some(Platform::Windows);
+                }
+            }
+        }
+        
+        None
+    }
 }
 
 fn init_mac_keymap() -> HashMap<u32, UnifiedKey> {
@@ -526,11 +612,11 @@ fn bin_coordinate(coord: i32) -> usize {
 fn bin_coordinates(x: i32, y: i32, is_wheel: bool) -> usize {
     let x_bin = bin_coordinate(x);
     let y_bin = bin_coordinate(y);
-    let base_token = y_bin * 9 + x_bin + KEY_COUNT;
+    let base_token = y_bin * 9 + x_bin;
     if is_wheel {
-        base_token + COUNT_OF_VARIANTS
+        base_token + WHEEL_START
     } else {
-        base_token
+        base_token + KEY_COUNT
     }
 }
 
@@ -546,13 +632,16 @@ fn unbin_coordinate(bin: usize) -> i32 {
 
 fn unbin_value(value: usize) -> (i32, i32, bool) {
     let is_wheel = value >= WHEEL_START;
-    let value = if is_wheel {
+    let adjusted_value = if is_wheel {
         value - WHEEL_START
     } else {
         value - KEY_COUNT
     };
-    let y_bin = value / 9;
-    let x_bin = value % 9;
+    if adjusted_value >= 81 {
+        panic!("Invalid mouse/wheel token value: {}, is_wheel: {}, original value: {}, WHEEL_START: {}, KEY_COUNT: {}", adjusted_value, is_wheel, value, WHEEL_START, KEY_COUNT);
+    }
+    let y_bin = adjusted_value / 9;
+    let x_bin = adjusted_value % 9;
     (unbin_coordinate(x_bin), unbin_coordinate(y_bin), is_wheel)
 }
 
@@ -912,18 +1001,31 @@ fn parse_frames_log(frameslog: &str, display_num: usize) -> Vec<(usize, usize)> 
     tokens
 }
 
-pub fn chunk_tokenizer(chunk_path: &std::path::Path, os_type: &str) -> Vec<(usize, usize)> {
+pub fn chunk_tokenizer(chunk_path: &std::path::Path, os_type: Option<&str>) -> Vec<(usize, usize)> {
     let mut chunk_tokens = Vec::new();
     
+    // Determine platform - either from provided os_type or auto-detect
+    let platform = match os_type {
+        Some(os) => Platform::from_str(os).unwrap_or_else(|| {
+            eprintln!("Invalid OS type '{}', attempting to auto-detect platform...", os);
+            Platform::detect_from_logs(chunk_path).unwrap_or_else(|| {
+                eprintln!("Platform auto-detection failed, defaulting to Mac.");
+                Platform::Mac
+            })
+        }),
+        None => Platform::detect_from_logs(chunk_path).unwrap_or_else(|| {
+            eprintln!("Platform auto-detection failed, defaulting to Mac.");
+            Platform::Mac
+        })
+    };
     
     let keypresses_path = chunk_path.join("keypresses.log");
     if keypresses_path.exists() {
         match std::fs::read_to_string(&keypresses_path) {
             Ok(keylog) => {
-                let key_tokens = if os_type == "Windows" {
-                    parse_windows_keylog(&keylog)
-                } else {
-                    parse_mac_keylog(&keylog)
+                let key_tokens = match platform {
+                    Platform::Windows => parse_windows_keylog(&keylog),
+                    Platform::Mac => parse_mac_keylog(&keylog),
                 };
                 chunk_tokens.extend(key_tokens);
             },
@@ -931,8 +1033,6 @@ pub fn chunk_tokenizer(chunk_path: &std::path::Path, os_type: &str) -> Vec<(usiz
                 eprintln!("Error reading file {}: {}", keypresses_path.display(), e);
             }
         }
-    } else {
-        println!("No keypresses.log found in {}", chunk_path.display());
     }
     
     
@@ -940,10 +1040,9 @@ pub fn chunk_tokenizer(chunk_path: &std::path::Path, os_type: &str) -> Vec<(usiz
     if mouselog_path.exists() {
         match std::fs::read_to_string(&mouselog_path) {
             Ok(mouselog) => {
-                let mouse_tokens = if os_type == "Windows" {
-                    parse_windows_mouselog(&mouselog)
-                } else {
-                    parse_mac_mouselog(&mouselog)
+                let mouse_tokens = match platform {
+                    Platform::Windows => parse_windows_mouselog(&mouselog),
+                    Platform::Mac => parse_mac_mouselog(&mouselog),
                 };
                 chunk_tokens.extend(mouse_tokens);
             }
@@ -951,8 +1050,6 @@ pub fn chunk_tokenizer(chunk_path: &std::path::Path, os_type: &str) -> Vec<(usiz
                 eprintln!("Error reading file {}: {}", mouselog_path.display(), e);
             }
         }
-    } else {
-        println!("No mouse.log found in {}", chunk_path.display());
     }
     
     
@@ -1004,71 +1101,90 @@ pub fn chunk_tokenizer(chunk_path: &std::path::Path, os_type: &str) -> Vec<(usiz
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <session_directory>", args[0]);
+        eprintln!("Usage: {} <session_directory_or_chunk_directory>", args[0]);
         std::process::exit(1);
     }
     
-    let session_dir = &args[1];
-    let session_path = std::path::Path::new(session_dir);
+    let input_path_str = &args[1];
+    let input_path = std::path::Path::new(input_path_str);
     
-    if !session_path.exists() || !session_path.is_dir() {
-        eprintln!("Error: The specified path '{}' does not exist or is not a directory", session_dir);
+    if !input_path.exists() || !input_path.is_dir() {
+        eprintln!("Error: The specified path '{}' does not exist or is not a directory", input_path_str);
         std::process::exit(1);
     };
     
+    // Check if this is a chunk directory or a session directory
+    let is_chunk_dir = input_path.file_name()
+        .map(|name| name.to_string_lossy().starts_with("chunk_"))
+        .unwrap_or(false);
     
-    let metadata_path = session_path.join("session_metadata.json");
-    let os_type = if metadata_path.exists() {
-        match std::fs::read_to_string(&metadata_path) {
-            Ok(metadata) => {
-                if metadata.contains("\"os_name\": \"Windows\"") {
-                    println!("Detected Windows OS");
-                    "Windows"
-                } else if metadata.contains("\"os_name\": \"Darwin\"") {
-                    println!("Detected macOS");
-                    "Darwin"
-                } else {
-                    eprintln!("Unknown OS type in metadata file");
-                    std::process::exit(1);
+    let start_time = std::time::Instant::now();
+    let mut all_tokens = Vec::new();
+    
+    if is_chunk_dir {
+        // Process a single chunk directory
+        println!("Processing single chunk directory: {}", input_path.display());
+        let os_type = None; // Auto-detect OS type for single chunk
+        let chunk_tokens = chunk_tokenizer(input_path, os_type);
+        all_tokens.extend(chunk_tokens);
+    } else {
+        // Process a session directory with multiple chunks
+        println!("Processing session directory: {}", input_path.display());
+        
+        // Try to determine OS type from metadata
+        let metadata_path = input_path.join("session_metadata.json");
+        let os_type = if metadata_path.exists() {
+            match std::fs::read_to_string(&metadata_path) {
+                Ok(metadata) => {
+                    if metadata.contains("\"os_name\": \"Windows\"") {
+                        println!("Detected Windows OS from metadata");
+                        Some("Windows")
+                    } else if metadata.contains("\"os_name\": \"Darwin\"") {
+                        println!("Detected macOS from metadata");
+                        Some("Mac")
+                    } else {
+                        println!("Unknown OS type in metadata file, will attempt auto-detection");
+                        None
+                    }
+                },
+                Err(e) => {
+                    println!("Error reading metadata file: {}. Will attempt auto-detection.", e);
+                    None
+                }
+            }
+        } else {
+            println!("No metadata file found at {}. Will attempt auto-detection.", metadata_path.display());
+            None
+        };
+        
+        // Process all chunk directories in the session
+        match std::fs::read_dir(input_path) {
+            Ok(entries) => {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        
+                        if path.is_dir() && path.file_name().unwrap_or_default().to_string_lossy().starts_with("chunk_") {
+                            let chunk_tokens = chunk_tokenizer(&path, os_type);
+                            all_tokens.extend(chunk_tokens);
+                        }
+                    }
                 }
             },
             Err(e) => {
-                eprintln!("Error reading metadata file: {}", e);
+                eprintln!("Error reading directory {}: {}", input_path_str, e);
                 std::process::exit(1);
             }
         }
-    } else {
-        eprintln!("No metadata file found at {}", metadata_path.display());
-        std::process::exit(1);
-    };
-    
-    let start_time = std::time::Instant::now();
-    
-    match std::fs::read_dir(session_path) {
-        Ok(entries) => {
-            let mut all_tokens = Vec::new();
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    
-                    if path.is_dir() && path.file_name().unwrap_or_default().to_string_lossy().starts_with("chunk_") {
-                        let chunk_tokens = chunk_tokenizer(&path, os_type);
-                        all_tokens.extend(chunk_tokens);
-                    }
-                }
-            }
-            
-            let elapsed = start_time.elapsed();
-            let tokens_per_second = all_tokens.len() as f64 / elapsed.as_secs_f64();
-            println!("Token sequence generation completed in {:.2?} ({:.2} tokens/sec)", elapsed, tokens_per_second);
-            
-            println!("Combined sorted tokens:");
-            all_tokens.sort_by_key(|(seq, _)| *seq);
-            print_token_sequence(&all_tokens[..all_tokens.len().min(500)]);
-        },
-        Err(e) => {
-            eprintln!("Error reading directory {}: {}", session_dir, e);
-            std::process::exit(1);
-        }
     }
+    
+    // Sort and display results
+    all_tokens.sort_by_key(|(seq, _)| *seq);
+    
+    let elapsed = start_time.elapsed();
+    let tokens_per_second = all_tokens.len() as f64 / elapsed.as_secs_f64();
+    println!("Token sequence generation completed in {:.2?} ({:.2} tokens/sec)", elapsed, tokens_per_second);
+    
+    println!("Combined sorted tokens:");
+    print_token_sequence(&all_tokens[..all_tokens.len().min(500)]);
 }
