@@ -864,7 +864,7 @@ fn start_new_ffmpeg_process(
             "-pix_fmt", platform::FFMPEG_PIXEL_FORMAT,
             "-color_range", "tv",
             "-s", &format!("{}x{}", width, height),
-            "-r", "30",
+            "-r", "60",
             "-i", "pipe:0",
             "-vf", "scale=1280:-1",
             "-c:v", platform::FFMPEG_ENCODER,
@@ -928,7 +928,7 @@ fn handle_capture_error(error_tx: &Sender<()>) {
 
 fn initialize_capturer(target: &Target) -> Option<Arc<Mutex<Capturer>>> {
     let opts = Options {
-        fps: 30,
+        fps: 60,
         output_type: if cfg!(target_os = "macos") { FrameType::YUVFrame } else { FrameType::BGRAFrame },
         output_resolution: Resolution::_720p,
         target: Some(target.clone()),
