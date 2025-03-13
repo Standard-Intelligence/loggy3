@@ -18,9 +18,8 @@ long_description = """
 A screen recording application with input monitoring capabilities.
 """
 
-[[bin]]
-name = "tokens"
-path = "src/tokens.rs"
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.bin]
+tokens = { path = "src/tokens.rs" }
 
 [dependencies]
 scap = "0.0.8"
@@ -37,6 +36,9 @@ ureq = { version = "2.9.1", features = ["json"] }
 sysinfo = "0.30.5"
 uuid = { version = "1.6.1", features = ["v4"] }
 fs2 = "0.4.3"
+
+# PyO3 only for non-macOS, non-Windows platforms
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 pyo3 = { version = "0.19.0", features = ["extension-module"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
