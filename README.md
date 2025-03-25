@@ -2,6 +2,8 @@
 
 Loggy3 records your screen and tracks keyboard/mouse actions with precise timestamps.
 
+Website: https://loggy3.com/
+
 ## Installation Instructions
 
 ### For Windows Users
